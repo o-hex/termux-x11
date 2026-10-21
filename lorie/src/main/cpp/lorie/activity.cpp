@@ -461,6 +461,11 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, __unused void *reserved) {
                 if (!r || r->destroyed) return;
                 r->renderer.setFiltering(filtering);
             }},
+            {"setSwapInterval", "(JI)V", (void *) +[](__unused JNIEnv* env, __unused jobject self, jlong ptr, jint interval) {
+                auto* r = (LorieViewResources*) ptr;
+                if (!r || r->destroyed) return;
+                r->renderer.setSwapInterval(interval);
+            }},
             {"connect", "(JI)V", (void *) +[](__unused JNIEnv* env, __unused jclass clazz, jlong ptr, jint fd) {
                 auto* r = (LorieViewResources*) ptr;
                 if (!r) return;

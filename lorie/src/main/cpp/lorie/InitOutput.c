@@ -15,6 +15,7 @@
 #include <sys/eventfd.h>
 #include <sys/errno.h>
 #include <sys/socket.h>
+#include <stdio.h>
 #include <string.h>
 #include <libxcvt/libxcvt.h>
 #include <X11/X.h>
@@ -754,8 +755,10 @@ static void lorieWorkingQueueCallback(int fd, int __unused ready, void __unused 
     eventfd_read(fd, &dummy);
 }
 
-void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d) {
+void lorieChoreographerFrameCallback(long t, AChoreographer* d) {
     AChoreographer_postFrameCallback(d, (AChoreographer_frameCallback) lorieChoreographerFrameCallback, d);
+    if (pvfb->state)
+        pvfb->state->lastVsyncNanos = t;
     if (pScreenPtr) {
         QueueWorkProc(lorieRedraw, NULL, NULL);
         lorieWakeServer();
@@ -777,6 +780,8 @@ static Bool lorieScreenInit(ScreenPtr pScreen, unused int argc, unused char **ar
     pScreen->whitePixel = 1;
 
     pvfb->vblank_interval = 1000000 / pvfb->root.framerate;
+    if (pvfb->state)
+        pvfb->state->vsyncIntervalNanos = (int64_t) pvfb->vblank_interval * 1000;
 
     if (FALSE
           || !miSetVisualTypesAndMasks(24, ((1 << TrueColor) | (1 << DirectColor)), 8, TrueColor, 0xFF0000, 0x00FF00, 0x0000FF)
@@ -830,6 +835,8 @@ void lorieConfigureNotify(int width, int height, int framerate, size_t name_size
         log(VERBOSE, "New reported framerate is %d", framerate);
         pvfb->root.framerate = framerate;
         pvfb->vblank_interval = 1000000 / pvfb->root.framerate;
+    if (pvfb->state)
+        pvfb->state->vsyncIntervalNanos = (int64_t) pvfb->vblank_interval * 1000;
     }
 }
 
@@ -1431,14 +1438,39 @@ static int lorieGetModifiers(__unused ScreenPtr screen, uint32_t format, uint32_
     return TRUE;
 }
 
+static int lorieDri3Open(__unused ScreenPtr screen, __unused RRProviderPtr provider, int *fd) {
+    static const char *const devices[] = {
+        "/dev/kgsl-3d0",
+        "/dev/dri/renderD128",
+        "/dev/dri/renderD129",
+        "/dev/dri/card0",
+        "/dev/mali0",
+    };
+    for (size_t i = 0; i < sizeof(devices) / sizeof(devices[0]); i++) {
+        int dev_fd = open(devices[i], O_RDWR | O_CLOEXEC);
+        if (dev_fd >= 0) {
+            *fd = dev_fd;
+            return Success;
+        }
+    }
+    return BadMatch;
+}
+
 static dri3_screen_info_rec lorieDri3Info = {
         .version = 2,
+        .open = lorieDri3Open,
         .fds_from_pixmap = lorieFdsFromPixmap,
         .pixmap_from_fds = loriePixmapFromFds,
         .get_formats = lorieGetFormats,
         .get_modifiers = lorieGetModifiers,
         .get_drawable_modifiers = FalseNoop
 };
+
+static int lorieGlxSwapInterval(unused __GLXdrawable *drawable, int interval) {
+    if (interval < 0)
+        return BadValue;
+    return Success;
+}
 
 static GLboolean drawableSwapBuffers(unused ClientPtr client, unused __GLXdrawable * drawable) { return TRUE; }
 static void drawableCopySubBuffer(unused __GLXdrawable * basePrivate, unused int x, unused int y, unused int w, unused int h) {}
@@ -1476,6 +1508,7 @@ static __GLXscreen *glXDRIscreenProbe(ScreenPtr pScreen) {
 
     screen->destroy = glXDRIscreenDestroy;
     screen->createDrawable = createDrawable;
+    screen->swapInterval = lorieGlxSwapInterval;
     screen->pScreen = pScreen;
     screen->fbconfigs = configs;
     screen->glvnd = "mesa";
@@ -1493,7 +1526,18 @@ static __GLXscreen *glXDRIscreenProbe(ScreenPtr pScreen) {
     __glXEnableExtension(screen->glx_enable_bits, "GLX_ARB_fbconfig_float");
     __glXEnableExtension(screen->glx_enable_bits, "GLX_EXT_fbconfig_packed_float");
     __glXEnableExtension(screen->glx_enable_bits, "GLX_EXT_texture_from_pixmap");
+    __glXEnableExtension(screen->glx_enable_bits, "GLX_SGI_swap_control");
+    __glXEnableExtension(screen->glx_enable_bits, "GLX_EXT_swap_control");
+    __glXEnableExtension(screen->glx_enable_bits, "GLX_MESA_swap_control");
     __glXScreenInit(screen, pScreen);
+
+    if (screen->GLXextensions) {
+        char *exts = NULL;
+        if (asprintf(&exts, "%s GLX_EXT_swap_control GLX_MESA_swap_control", screen->GLXextensions) != -1) {
+            free(screen->GLXextensions);
+            screen->GLXextensions = exts;
+        }
+    }
 
     return screen;
 }

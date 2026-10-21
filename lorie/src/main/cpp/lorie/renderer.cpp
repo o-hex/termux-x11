@@ -25,8 +25,12 @@
 #include <dlfcn.h>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include "list.h"
 #include "lorie.h"
@@ -37,11 +41,25 @@ __attribute__((weak)) EGLClientBuffer eglGetNativeClientBufferANDROID(const stru
 #define log(...) __android_log_print(ANDROID_LOG_DEBUG, "gles-renderer", __VA_ARGS__)
 #define loge(...) __android_log_print(ANDROID_LOG_ERROR, "gles-renderer", __VA_ARGS__)
 
-static constexpr EGLTimeKHR FENCE_TIMEOUT_NANOS = 100000000;
-
-static void waitForFence(EGLDisplay egl_display, EGLSync fence, EGLint flags) {
-    if (eglClientWaitSyncKHR(egl_display, fence, flags, FENCE_TIMEOUT_NANOS) == EGL_TIMEOUT_EXPIRED_KHR)
-        loge("GPU fence wasn't signalled within %lldns, proceeding without it", (long long) FENCE_TIMEOUT_NANOS);
+// Waits for a GPU fence, bounded to (roughly) one vsync period instead of EGL_FOREVER: some
+// GPU drivers lose a fence's signal across a power state transition, wedging the caller forever.
+static void waitForFence(EGLDisplay egl_display, EGLSync fence, lorie_shared_server_state* state) {
+    const int64_t defaultIntervalNanos = 1000000000LL / 30; // no vsync tick observed yet
+    int64_t interval = (state && state->vsyncIntervalNanos > 0) ? state->vsyncIntervalNanos : defaultIntervalNanos;
+    int64_t budget = interval;
+    if (state && state->vsyncIntervalNanos > 0) {
+        struct timespec now{};
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int64_t nowNanos = (int64_t) now.tv_sec * 1000000000LL + now.tv_nsec;
+        int64_t nextVsync = state->lastVsyncNanos + interval;
+        while (nextVsync <= nowNanos)
+            nextVsync += interval;
+        budget = nextVsync - nowNanos;
+    }
+    budget -= budget / 10;
+    EGLTimeKHR timeout = (EGLTimeKHR) (budget > 0 ? budget : 0);
+    if (eglClientWaitSyncKHR(egl_display, fence, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, timeout) == EGL_TIMEOUT_EXPIRED_KHR)
+        loge("Xlorie: GPU fence wasn't signalled within %lldns, proceeding without it\n", (long long) timeout);
     eglDestroySyncKHR(egl_display, fence);
 }
 
@@ -359,6 +377,12 @@ void Renderer::setFiltering(jint f) {
     filtering = f;
 }
 
+void Renderer::setSwapInterval(int interval) {
+    swapInterval = interval;
+    if (sfc && sfc != defaultSfc)
+        eglSwapInterval(egl_display, swapInterval);
+}
+
 // Mimics what the X server and the renderer do to the root buffer: the server holds a CPU lock
 // while the renderer draws into the same buffer. Needs a current GLES context.
 static bool cpuAndGpuShareAhbMemory(EGLDisplay egl_display) {
@@ -649,6 +673,9 @@ void Renderer::setWindow(JNIEnv *env, jobject jsfc) {
 
 void Renderer::releaseWinAndSurface(ANativeWindow** anw, EGLSurface *esfc) {
     if (esfc && *esfc && *esfc != defaultSfc) {
+        // Ensure non-blocking swap before destruction to prevent UI thread hangs
+        eglSwapInterval(egl_display, 0);
+        appliedSwapInterval = 0;
         // Requeue the dequeued buffer, causes flickering during window reconfiguring
         eglSwapBuffers(egl_display, *esfc);
         if (eglMakeCurrent(egl_display, defaultSfc, defaultSfc, ctx) != EGL_TRUE)
@@ -740,7 +767,8 @@ void Renderer::refreshContext() {
         return vprintEglError("eglMakeCurrent failed", __LINE__);
     }
 
-    eglSwapInterval(egl_display, 0);
+    eglSwapInterval(egl_display, sfc != defaultSfc ? swapInterval : 0);
+    appliedSwapInterval = sfc != defaultSfc ? swapInterval : 0;
 
     // We should redraw image at least once right after surface change
     if (state)
@@ -889,7 +917,7 @@ void Renderer::applyPendingGpuCopies() {
     if (serial) {
         EGLSync fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, nullptr);
         glFlush();
-        waitForFence(egl_display, fence, 0);
+        waitForFence(egl_display, fence, state);
         // Only now that the GPU has actually finished (not just been told to start) is it safe to
         // let present_execute_copy release/idle the source pixmap back to the client.
         __atomic_store_n(&state->gpuCopyQueue.completedSerial, serial, __ATOMIC_RELEASE);
@@ -1040,6 +1068,8 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
     uint64_t gpuCopySerial = applyPendingGpuCopiesLocked();
     state->drawRequested = FALSE;
 
+    checkCustomShader();
+
     LorieBuffer_bindTexture(buffer);
     if (desc->type == LORIEBUFFER_FD)
         xfactor = (float) desc->width/(float) desc->stride;
@@ -1065,7 +1095,7 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
     glFlush();
 
     // Wait until root window drawing is finished before giving control back to X server
-    waitForFence(egl_display, fence, 0);
+    waitForFence(egl_display, fence, state);
     if (gpuCopySerial) {
         __atomic_store_n(&state->gpuCopyQueue.completedSerial, gpuCopySerial, __ATOMIC_RELEASE);
         notifyGpuCopyDone();
@@ -1073,17 +1103,26 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
     state->waitForNextFrame = true;
     lorie_mutex_unlock(&state->lock, &state->lockingPid);
 
+    if (appliedSwapInterval != swapInterval && sfc != defaultSfc) {
+        eglSwapInterval(egl_display, swapInterval);
+        appliedSwapInterval = swapInterval;
+    }
+
     if (eglSwapBuffers(egl_display, sfc) != EGL_TRUE)
         printEglError("Failed to swap buffers", __LINE__);
 
-    // Perform a little drawing operation to make sure the next buffer is ready on the next invocation of drawing
-    glEnable(GL_SCISSOR_TEST);
-    glScissor(0, 0, 1, 1);
-    glClearColor(0, 0, 0, 0);
-    glClear(GL_COLOR_BUFFER_BIT);
-    glDisable(GL_SCISSOR_TEST);
-    fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, nullptr);
-    waitForFence(egl_display, fence, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR);
+    // Only perform pre-dequeue scissor clear when swapInterval == 0.
+    // When swapInterval >= 1, pre-dequeuing blocks until the next VSync, causing
+    // double-waiting latency and cutting refresh rate in half (e.g. 60 FPS -> 30 FPS).
+    if (swapInterval == 0) {
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(0, 0, 1, 1);
+        glClearColor(0, 0, 0, 0);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDisable(GL_SCISSOR_TEST);
+        fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, nullptr);
+        waitForFence(egl_display, fence, state);
+    }
 
     state->renderedFrames++;
 }
@@ -1200,6 +1239,9 @@ void Renderer::threadLoop() {
 
     glDeleteProgram(g_texture_program);
     glDeleteProgram(g_texture_program_bgra);
+    if (progCustom && progCustom != g_texture_program) glDeleteProgram(progCustom);
+    if (progCustomBgra && progCustomBgra != g_texture_program_bgra && progCustomBgra != progCustom)
+        glDeleteProgram(progCustomBgra);
     glDeleteTextures(1, &cursor.id);
     eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     if (sfc != defaultSfc) // defensive; setWindow(nullptr) already reverts this before onDetachedFromWindow runs
@@ -1252,6 +1294,8 @@ static GLuint createProgram(const char* p_vertex_source, const char* p_fragment_
 
     glAttachShader(program, vertexShader);
     glAttachShader(program, pixelShader);
+    glBindAttribLocation(program, 0, "position");
+    glBindAttribLocation(program, 1, "texCoords");
     glLinkProgram(program);
     glGetProgramiv(program, GL_LINK_STATUS, &linkStatus);
     if (linkStatus == GL_TRUE)
@@ -1276,10 +1320,16 @@ void Renderer::drawRegion(GLuint id, float x0, float y0, float x1, float y1, flo
         x1, -y1, u1, v1,
     };
 
+    GLuint prog = flip ? g_texture_program_bgra : g_texture_program;
     GLuint p = flip ? gv_pos_bgra : gv_pos, c = flip ? gv_coords_bgra : gv_coords;
+    if (customShaderLoaded && (flip ? progCustomBgra : progCustom)) {
+        prog = flip ? progCustomBgra : progCustom;
+        p = 0;
+        c = 1;
+    }
 
     glActiveTexture(GL_TEXTURE0);
-    glUseProgram(flip ? g_texture_program_bgra : g_texture_program);
+    glUseProgram(prog);
     if (id)
         glBindTexture(GL_TEXTURE_2D, id);
 
@@ -1290,6 +1340,85 @@ void Renderer::drawRegion(GLuint id, float x0, float y0, float x1, float y1, flo
     glEnableVertexAttribArray(p);
     glEnableVertexAttribArray(c);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4); checkGlError();
+}
+
+void Renderer::checkCustomShader() {
+    if ((customShaderCheckCounter++ & 63) != 0)
+        return;
+
+    static const char* const customShaderPaths[] = {
+        "/data/data/com.termux/files/home/.config/termux-x11/shaders/upscaler.frag",
+        "/data/data/com.termux/files/home/.config/termux-x11/upscaler.glsl",
+        "/sdcard/termux-x11/shaders/upscaler.frag",
+        "/sdcard/termux_upscaler.glsl",
+        "/sdcard/Download/termux_upscaler.glsl"
+    };
+
+    const char* foundPath = nullptr;
+    struct stat st{};
+    for (size_t i = 0; i < sizeof(customShaderPaths) / sizeof(customShaderPaths[0]); i++) {
+        if (stat(customShaderPaths[i], &st) == 0 && S_ISREG(st.st_mode)) {
+            foundPath = customShaderPaths[i];
+            break;
+        }
+    }
+
+    if (!foundPath) {
+        if (customShaderLoaded) {
+            log("Xlorie: custom shader removed, reverting to standard pipeline\n");
+            if (progCustom && progCustom != g_texture_program) glDeleteProgram(progCustom);
+            if (progCustomBgra && progCustomBgra != g_texture_program_bgra && progCustomBgra != progCustom)
+                glDeleteProgram(progCustomBgra);
+            progCustom = 0;
+            progCustomBgra = 0;
+            customShaderLoaded = false;
+            customShaderMtime = 0;
+        }
+        return;
+    }
+
+    if (customShaderLoaded && st.st_mtime == customShaderMtime)
+        return;
+
+    FILE* f = fopen(foundPath, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (len <= 0 || len > 256 * 1024) { fclose(f); return; }
+
+    char* src = (char*) malloc(len + 1);
+    if (!src) { fclose(f); return; }
+    fread(src, 1, len, f);
+    src[len] = '\0';
+    fclose(f);
+
+    GLuint newProg = createProgram(vertexShaderSrc, src);
+    if (!newProg) {
+        loge("Xlorie: failed to compile custom shader from %s\n", foundPath);
+        free(src);
+        return;
+    }
+
+    char* bgraSrc = (char*) malloc(len + 128);
+    GLuint newProgBgra = newProg;
+    if (bgraSrc) {
+        snprintf(bgraSrc, len + 128, "#define BGRA_INPUT 1\n%s", src);
+        GLuint pBgra = createProgram(vertexShaderSrc, bgraSrc);
+        if (pBgra) newProgBgra = pBgra;
+        free(bgraSrc);
+    }
+    free(src);
+
+    if (progCustom && progCustom != g_texture_program) glDeleteProgram(progCustom);
+    if (progCustomBgra && progCustomBgra != g_texture_program_bgra && progCustomBgra != progCustom)
+        glDeleteProgram(progCustomBgra);
+
+    progCustom = newProg;
+    progCustomBgra = newProgBgra;
+    customShaderLoaded = true;
+    customShaderMtime = st.st_mtime;
+    log("Xlorie: loaded and compiled custom shader from %s (mtime %ld)\n", foundPath, (long) customShaderMtime);
 }
 
 void Renderer::drawCursor(float displayWidth, float displayHeight, float sourceLeft, float sourceTop, float cursorX, float cursorY) {

@@ -94,6 +94,7 @@ public class MainActivity extends AppCompatActivity {
 
     public static Handler handler = new Handler();
     private final Runnable connectRetry = this::tryConnect;
+    private int connectRetryInterval = 250;
     FrameLayout frm;
     TouchInputHandler mInputHandler;
     protected ICmdEntryInterface service = null;
@@ -708,6 +709,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     void connectToService(IBinder ibinder) {
+        connectRetryInterval = 250;
         service = ICmdEntryInterface.Stub.asInterface(ibinder);
         try {
             if (service != null && service.asBinder().isBinderAlive()) {
@@ -764,7 +766,9 @@ public class MainActivity extends AppCompatActivity {
 
     void scheduleConnect() {
         handler.removeCallbacks(connectRetry);
-        handler.postDelayed(connectRetry, 250);
+        handler.postDelayed(connectRetry, connectRetryInterval);
+        if (connectRetryInterval < 1000)
+            connectRetryInterval = Math.min(connectRetryInterval * 2, 1000);
     }
 
     void onPreferencesChanged(String key) {
@@ -832,6 +836,10 @@ public class MainActivity extends AppCompatActivity {
 
         lastServerHeartbeat = lastServerWatchdogRun = SystemClock.uptimeMillis();
         handler.postDelayed(serverWatchdog, SERVER_WATCHDOG_INTERVAL_MS);
+
+        connectRetryInterval = 250;
+        if (!getLorieView().connected())
+            scheduleConnect();
     }
 
     private void checkServerHeartbeat() {
@@ -856,6 +864,7 @@ public class MainActivity extends AppCompatActivity {
 
         getLorieView().setKeyboardVisible(false);
 
+        handler.removeCallbacks(connectRetry);
         handler.removeCallbacks(serverWatchdog);
         findViewById(R.id.no_server_signal).setVisibility(View.GONE);
         orientationListener.disable();
@@ -1278,10 +1287,13 @@ public class MainActivity extends AppCompatActivity {
             getLorieView().setVisibility(connected?View.VISIBLE:View.INVISIBLE);
 
             // We should recover connection in the case if file descriptor for some reason was broken...
-            if (!connected)
+            if (!connected) {
                 tryConnect();
-            else
+            } else {
+                connectRetryInterval = 250;
+                handler.removeCallbacks(connectRetry);
                 getLorieView().setPointerIcon(PointerIcon.getSystemIcon(this, PointerIcon.TYPE_NULL));
+            }
 
             applyWindowSettings();
         });

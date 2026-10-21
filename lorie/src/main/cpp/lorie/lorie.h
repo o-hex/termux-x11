@@ -249,6 +249,9 @@ struct lorie_shared_server_state {
     /* Needed to show FPS counter in logcat */
     volatile int renderedFrames;
 
+    volatile int64_t lastVsyncNanos; // Last vsync, CLOCK_MONOTONIC nanoseconds.
+    volatile int64_t vsyncIntervalNanos; // Frame period, nanoseconds. Bounds waitForFence().
+
     struct {
         // We should not allow updating cursor content the same time renderer draws it.
         // locking the mutex protecting the root window can cause waiting for the frame to be drawn which is unacceptable
@@ -278,6 +281,13 @@ struct Renderer {
     ANativeWindow *defaultWin = nullptr, *win = nullptr;
     struct xorg_list addedBuffers{}, buffers{}, removedBuffers{};
     volatile jint filtering = GL_NEAREST;
+    volatile jint swapInterval = 1;
+    int appliedSwapInterval = -1;
+
+    GLuint progCustom = 0, progCustomBgra = 0;
+    time_t customShaderMtime = 0;
+    bool customShaderLoaded = false;
+    uint32_t customShaderCheckCounter = 0;
 
     pthread_t thread = 0;
     volatile bool stopping = false;
@@ -343,6 +353,8 @@ struct Renderer {
     void* initThread();
     int getWakeupCondFd() const;
     void setFiltering(jint f);
+    void setSwapInterval(int interval);
+    void checkCustomShader();
     void testCapabilities(int* legacy_drawing, int* gpu_present_disabled);
     void setSharedState(struct lorie_shared_server_state* newState);
     void addBuffer(LorieBuffer* buf);
