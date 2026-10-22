@@ -39,7 +39,7 @@
 // libEGL exports this only since API 26, weak so the library still loads below that.
 __attribute__((weak)) EGLClientBuffer eglGetNativeClientBufferANDROID(const struct AHardwareBuffer* buffer);
 
-#define log(...) __android_log_print(ANDROID_LOG_DEBUG, "gles-renderer", __VA_ARGS__)
+#define log(...) __android_log_print(ANDROID_LOG_INFO, "gles-renderer", __VA_ARGS__)
 #define loge(...) __android_log_print(ANDROID_LOG_ERROR, "gles-renderer", __VA_ARGS__)
 
 // Waits for a GPU fence, bounded to (roughly) one vsync period instead of EGL_FOREVER: some
@@ -970,11 +970,13 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
     desc = LorieBuffer_description(buffer);
 
     int alignedExpectedW = expectedW - (expectedW % CVT_H_GRANULARITY);
+    int alignedExpectedH = (expectedH + 3) & ~3;
 
-    if (!expectedW || !expectedH || desc->height != expectedH ||
+    if (!expectedW || !expectedH ||
+        (desc->height != expectedH && desc->height != alignedExpectedH) ||
         (desc->width != alignedExpectedW && desc->width != expectedW)) {
-        log("Buffer %llu is not of expected size, expecting %dx%d or %dx%d, got %dx%d",
-            state->rootWindowTextureID, alignedExpectedW, expectedH, expectedW, expectedH,
+        log("Buffer %llu is not of expected size, expecting %dx(%d|%d) or %dx(%d|%d), got %dx%d",
+            state->rootWindowTextureID, alignedExpectedW, expectedH, alignedExpectedH, expectedW, expectedH, alignedExpectedH,
             desc->width, desc->height);
         // Otherwise rendererShouldWait sees drawRequested or a pending cursor update and busy-spins
         // retrying this same mismatch instead of waiting for the buffer of the requested size.
@@ -1006,7 +1008,8 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
         renderViewportY = (int) lroundf(centerY - (float) renderViewportH / 2.f);
     }
 
-    auto sourceWidth = (float) desc->width, sourceHeight = (float) desc->height;
+    auto sourceWidth = fminf((float) desc->width, (float) expectedW);
+    auto sourceHeight = fminf((float) desc->height, (float) expectedH);
     auto logicalSourceWidth = (float) expectedW, logicalSourceHeight = (float) expectedH;
     if (zoomPercent > 100) {
         float requestedScale = (float) zoomPercent / 100.f;
@@ -1377,6 +1380,10 @@ void Renderer::checkCustomShader() {
             shaderInotifyWd = inotify_add_watch(shaderInotifyFd,
                 "/data/data/com.termux/files/home/shaders",
                 IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVED_TO | IN_MOVED_FROM | IN_CLOSE_WRITE);
+            mkdir("/data/data/com.termux/files/home/.config/termux-x11", 0755);
+            inotify_add_watch(shaderInotifyFd,
+                "/data/data/com.termux/files/home/.config/termux-x11",
+                IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVED_TO | IN_MOVED_FROM | IN_CLOSE_WRITE);
         }
         triggerReload = true; // Initial probe on startup
     } else {
@@ -1451,7 +1458,7 @@ void Renderer::checkCustomShader() {
     char* bgraSrc = (char*) malloc(len + 128);
     GLuint newProgBgra = newProg;
     if (bgraSrc) {
-        snprintf(bgraSrc, len + 128, "#define BGRA_INPUT 1\n%s", src);
+        snprintf(bgraSrc, len + 128, "#define BGRA_INPUT 1\n#define SWIZZLE .bgra\n%s", src);
         GLuint pBgra = createProgram(vertexShaderSrc, bgraSrc);
         if (pBgra) newProgBgra = pBgra;
         free(bgraSrc);
