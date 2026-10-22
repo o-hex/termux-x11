@@ -31,6 +31,7 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/inotify.h>
 #include <unistd.h>
 #include "list.h"
 #include "lorie.h"
@@ -366,6 +367,11 @@ void Renderer::destroy() {
 
     pthread_join(thread, nullptr);
     thread = 0;
+    if (shaderInotifyFd >= 0) {
+        close(shaderInotifyFd);
+        shaderInotifyFd = -1;
+        shaderInotifyWd = -1;
+    }
     ctx = EGL_NO_CONTEXT; // re-passes init()'s `if (ctx) return;` guard for a future re-init
 }
 
@@ -1343,10 +1349,34 @@ void Renderer::drawRegion(GLuint id, float x0, float y0, float x1, float y1, flo
 }
 
 void Renderer::checkCustomShader() {
-    if ((customShaderCheckCounter++ & 63) != 0)
+    bool triggerReload = false;
+
+    if (shaderInotifyFd < 0) {
+        shaderInotifyFd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        if (shaderInotifyFd >= 0) {
+            mkdir("/data/data/com.termux/files/home/shaders", 0755);
+            shaderInotifyWd = inotify_add_watch(shaderInotifyFd,
+                "/data/data/com.termux/files/home/shaders",
+                IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVED_TO | IN_MOVED_FROM | IN_CLOSE_WRITE);
+        }
+        triggerReload = true; // Initial probe on startup
+    } else {
+        char eventBuf[sizeof(struct inotify_event) + 256];
+        ssize_t n = read(shaderInotifyFd, eventBuf, sizeof(eventBuf));
+        if (n > 0) {
+            triggerReload = true;
+        }
+    }
+
+    if (!triggerReload)
         return;
 
     static const char* const customShaderPaths[] = {
+        "/data/data/com.termux/files/home/shaders/active.glsl",
+        "/data/data/com.termux/files/home/shaders/current.glsl",
+        "/data/data/com.termux/files/home/shaders/upscaler.glsl",
+        "/data/data/com.termux/files/home/shaders/upscaler.frag",
+        "/data/data/com.termux/files/home/shaders/sgsr.glsl",
         "/data/data/com.termux/files/home/.config/termux-x11/shaders/upscaler.frag",
         "/data/data/com.termux/files/home/.config/termux-x11/upscaler.glsl",
         "/sdcard/termux-x11/shaders/upscaler.frag",

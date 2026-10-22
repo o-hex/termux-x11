@@ -288,6 +288,7 @@ struct Renderer {
     time_t customShaderMtime = 0;
     bool customShaderLoaded = false;
     uint32_t customShaderCheckCounter = 0;
+    int shaderInotifyFd = -1, shaderInotifyWd = -1;
 
     pthread_t thread = 0;
     volatile bool stopping = false;
