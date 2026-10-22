@@ -280,7 +280,7 @@ struct Renderer {
     EGLConfig cfg = nullptr;
     ANativeWindow *defaultWin = nullptr, *win = nullptr;
     struct xorg_list addedBuffers{}, buffers{}, removedBuffers{};
-    volatile jint filtering = GL_NEAREST;
+    volatile jint filtering = GL_LINEAR;
     volatile jint swapInterval = 1;
     int appliedSwapInterval = -1;
 
