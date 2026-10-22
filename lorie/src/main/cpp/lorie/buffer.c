@@ -259,7 +259,8 @@ __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_allocate(int32_t width, int32_t height,
         if (fd < 0)
             return NULL;
     } else if (type == LORIEBUFFER_AHARDWAREBUFFER) {
-        AHardwareBuffer_Desc desc = { .width = width, .height = height, .format = format, .layers = 1,
+        int32_t aligned_height = (height + 3) & ~3;
+        AHardwareBuffer_Desc desc = { .width = width, .height = aligned_height, .format = format, .layers = 1,
                 .usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER };
         int err = -1;
         if (__builtin_available(android 26, *))
@@ -313,8 +314,9 @@ __LIBC_HIDDEN__ void LorieBuffer_convert(LorieBuffer* buffer, int8_t type, int8_
         buffer->lockedData = NULL;
         buffer->locked = 0;
     } else {
+        int32_t aligned_height = (buffer->desc.height + 3) & ~3;
         AHardwareBuffer *b = NULL;
-        AHardwareBuffer_Desc desc = { .width = buffer->desc.width, .height = buffer->desc.height, .format = format, .layers = 1,
+        AHardwareBuffer_Desc desc = { .width = buffer->desc.width, .height = aligned_height, .format = format, .layers = 1,
                 .usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER };
         int err = -1;
         if (__builtin_available(android 26, *))
