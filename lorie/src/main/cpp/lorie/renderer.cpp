@@ -1394,19 +1394,23 @@ void Renderer::checkCustomShader() {
         }
     }
 
+    if (!triggerReload && (customShaderCheckCounter++ & 63) == 0) {
+        triggerReload = true;
+    }
+
     if (!triggerReload)
         return;
 
     static const char* const customShaderPaths[] = {
+        "/sdcard/Download/termux_upscaler.glsl",
+        "/sdcard/termux_upscaler.glsl",
         "/data/data/com.termux/files/home/shaders/active.glsl",
         "/data/data/com.termux/files/home/shaders/current.glsl",
         "/data/data/com.termux/files/home/shaders/upscaler.glsl",
         "/data/data/com.termux/files/home/shaders/upscaler.frag",
         "/data/data/com.termux/files/home/.config/termux-x11/shaders/upscaler.frag",
         "/data/data/com.termux/files/home/.config/termux-x11/upscaler.glsl",
-        "/sdcard/termux-x11/shaders/upscaler.frag",
-        "/sdcard/termux_upscaler.glsl",
-        "/sdcard/Download/termux_upscaler.glsl"
+        "/sdcard/termux-x11/shaders/upscaler.frag"
     };
 
     const char* foundPath = nullptr;
@@ -1473,7 +1477,7 @@ void Renderer::checkCustomShader() {
     progCustomBgra = newProgBgra;
     customShaderLoaded = true;
     customShaderMtime = st.st_mtime;
-    log("Xlorie: loaded and compiled custom shader from %s (mtime %ld)\n", foundPath, (long) customShaderMtime);
+    loge("Xlorie: loaded and compiled custom shader from %s (mtime %ld)\n", foundPath, (long) customShaderMtime);
 }
 
 void Renderer::drawCursor(float displayWidth, float displayHeight, float sourceLeft, float sourceTop, float cursorX, float cursorY) {
