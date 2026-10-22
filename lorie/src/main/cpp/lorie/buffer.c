@@ -283,7 +283,9 @@ __LIBC_HIDDEN__ void LorieBuffer_convert(LorieBuffer* buffer, int8_t type, int8_
     void *data;
     if (!buffer || buffer->desc.type != LORIEBUFFER_REGULAR
         || (type != LORIEBUFFER_FD && type != LORIEBUFFER_AHARDWAREBUFFER)
-        || (format != AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM && format != AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM))
+        || (format != AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM
+            && format != AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM
+            && format != AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM))
         return;
 
     if (type == LORIEBUFFER_FD) {
@@ -317,6 +319,11 @@ __LIBC_HIDDEN__ void LorieBuffer_convert(LorieBuffer* buffer, int8_t type, int8_
         int err = -1;
         if (__builtin_available(android 26, *))
             err = AHardwareBuffer_allocate(&desc, &b);
+        if (err != 0 && format == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM) {
+            desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+            if (__builtin_available(android 26, *))
+                err = AHardwareBuffer_allocate(&desc, &b);
+        }
         if (err != 0)
             return;
 
@@ -333,7 +340,7 @@ __LIBC_HIDDEN__ void LorieBuffer_convert(LorieBuffer* buffer, int8_t type, int8_
         }
 
         buffer->desc.type = type;
-        buffer->desc.format = format;
+        buffer->desc.format = desc.format;
         buffer->desc.stride = (int32_t) desc.stride;
         buffer->desc.buffer = b;
         free(buffer->desc.data);

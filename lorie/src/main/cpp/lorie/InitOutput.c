@@ -117,6 +117,7 @@ typedef struct {
     // Number of CPU accesses in progress that started a dma-buf sync, and whether one of them writes.
     uint8_t dmaBufAccessDepth;
     bool dmaBufAccessWrite;
+    uint8_t lockDepth;
     void *locked;
     void *mem;
 } LoriePixmapPriv;
@@ -132,11 +133,20 @@ static LorieBuffer *lorieEnsureGpuSampleable(PixmapPtr pixmap, int8_t type) {
 
     desc = LorieBuffer_description(priv->buffer);
     if (desc->type == LORIEBUFFER_REGULAR) {
-        LorieBuffer_convert(priv->buffer, type, AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM);
+        int8_t format = (pixmap->drawable.depth == 32)
+            ? AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM
+            : AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM;
+        LorieBuffer_convert(priv->buffer, type, format);
+        desc = LorieBuffer_description(priv->buffer);
         if (desc->type != LORIEBUFFER_REGULAR) {
-            // LorieBuffer_convert does not report status but it does not let the type change in the case of error.
+            // LorieBuffer_convert copied the pixels and unlocked the buffer.
+            // Reset priv->locked and pixmap->devPrivate.ptr so EXA PrepareAccess/FinishAccess
+            // properly lock and unlock the AHardwareBuffer on demand.
+            priv->locked = NULL;
+            priv->lockDepth = 0;
+            priv->wasLocked = FALSE;
             pScreenPtr->ModifyPixmapHeader(pixmap, 0, 0, 0, 0, desc->stride * 4, NULL);
-            LorieBuffer_lock(priv->buffer, &priv->locked);
+            pixmap->devPrivate.ptr = NULL;
         }
     }
 
@@ -1206,15 +1216,20 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
     if (lorieNeedsGpuLock(pPix, priv, index))
         lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
 
-    if (!priv->locked && !priv->mem) {
-        int err = LorieBuffer_lock(priv->buffer, &priv->locked);
-        if (err) {
-            dprintf(2, "Failed to lock buffer, err %d\n", err);
-            return FALSE;
-        }
-        priv->wasLocked = FALSE;
-    } else
-        priv->wasLocked = TRUE;
+    if (priv->lockDepth == 0) {
+        if (!priv->locked && !priv->mem) {
+            int err = LorieBuffer_lock(priv->buffer, &priv->locked);
+            if (err) {
+                dprintf(2, "Failed to lock buffer, err %d\n", err);
+                if (lorieNeedsGpuLock(pPix, priv, index))
+                    lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
+                return FALSE;
+            }
+            priv->wasLocked = FALSE;
+        } else
+            priv->wasLocked = TRUE;
+    }
+    priv->lockDepth++;
 
     // Imported dma-bufs may be rendered into by another device, the CPU caches must be synced.
     if (priv->buffer && !priv->mem) {
@@ -1239,10 +1254,12 @@ void lorieFinishAccess(PixmapPtr pPix, int index) {
         priv->dmaBufAccessWrite = false;
     }
 
-    if (!priv->wasLocked) {
-        LorieBuffer_unlock(priv->buffer);
-        priv->locked = NULL;
-        priv->wasLocked = FALSE;
+    if (priv->lockDepth && !--priv->lockDepth) {
+        if (!priv->wasLocked) {
+            LorieBuffer_unlock(priv->buffer);
+            priv->locked = NULL;
+            pPix->devPrivate.ptr = NULL;
+        }
     }
 }
 
@@ -1336,6 +1353,13 @@ static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *
 // renderer.cpp already probes for dma-buf backing: hand the whole AHardwareBuffer to ourselves
 // over a socketpair and pick out whichever received fd actually is a dma-buf.
 static int lorieFdsFromPixmap(__unused ScreenPtr screen, PixmapPtr pixmap, int *fds, uint32_t *strides, uint32_t *offsets, uint64_t *modifier) {
+    LoriePixmapPriv *priv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap);
+    if (priv && priv->locked && !priv->mem && priv->lockDepth == 0) {
+        LorieBuffer_unlock(priv->buffer);
+        priv->locked = NULL;
+        pixmap->devPrivate.ptr = NULL;
+    }
+
     LorieBuffer *buffer = lorieEnsureGpuSampleable(pixmap, LORIEBUFFER_AHARDWAREBUFFER);
     const LorieBuffer_Desc *desc;
     int sv[2] = { -1, -1 }, fd = -1;
@@ -1409,6 +1433,13 @@ static int lorieFdsFromPixmap(__unused ScreenPtr screen, PixmapPtr pixmap, int *
 // AHardwareBuffer itself (as opposed to fds_from_pixmap's plain dma-buf) to clients that need
 // the full handle, e.g. GLES import via eglGetNativeClientBufferANDROID.
 int lorieSendAHardwareBufferForPixmap(PixmapPtr pixmap, int socketFd) {
+    LoriePixmapPriv *priv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap);
+    if (priv && priv->locked && !priv->mem && priv->lockDepth == 0) {
+        LorieBuffer_unlock(priv->buffer);
+        priv->locked = NULL;
+        pixmap->devPrivate.ptr = NULL;
+    }
+
     LorieBuffer *buffer = lorieEnsureGpuSampleable(pixmap, LORIEBUFFER_AHARDWAREBUFFER);
     if (!buffer)
         return 0;
@@ -1418,9 +1449,9 @@ int lorieSendAHardwareBufferForPixmap(PixmapPtr pixmap, int socketFd) {
 }
 
 static int lorieGetFormats(__unused ScreenPtr screen, CARD32 *num_formats, CARD32 **formats) {
-    static CARD32 format = DRM_FORMAT_ARGB8888;
-    *num_formats = 1;
-    *formats = &format;
+    static CARD32 formats_list[] = { DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888 };
+    *num_formats = 2;
+    *formats = formats_list;
     return TRUE;
 }
 
