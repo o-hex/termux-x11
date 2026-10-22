@@ -289,6 +289,9 @@ struct Renderer {
     bool customShaderLoaded = false;
     uint32_t customShaderCheckCounter = 0;
     int shaderInotifyFd = -1, shaderInotifyWd = -1;
+    char requestedScaler[32] = "off";
+    char currentScaler[32] = "off";
+    volatile bool scalerChanged = false;
 
     pthread_t thread = 0;
     volatile bool stopping = false;
@@ -354,8 +357,11 @@ struct Renderer {
     void* initThread();
     int getWakeupCondFd() const;
     void setFiltering(jint f);
+    void setCustomScaler(const char* name);
     void setSwapInterval(int interval);
     void checkCustomShader();
+    void applyScalerOnRendererThread();
+    void checkCustomShaderFile();
     void testCapabilities(int* legacy_drawing, int* gpu_present_disabled);
     void setSharedState(struct lorie_shared_server_state* newState);
     void addBuffer(LorieBuffer* buf);

@@ -35,6 +35,7 @@
 #include <unistd.h>
 #include "list.h"
 #include "lorie.h"
+#include "builtin_shaders.h"
 
 // libEGL exports this only since API 26, weak so the library still loads below that.
 __attribute__((weak)) EGLClientBuffer eglGetNativeClientBufferANDROID(const struct AHardwareBuffer* buffer);
@@ -381,6 +382,21 @@ int Renderer::getWakeupCondFd() const {
 
 void Renderer::setFiltering(jint f) {
     filtering = f;
+}
+
+void Renderer::setCustomScaler(const char* name) {
+    const char* target = (name && name[0]) ? name : "off";
+    loge("Xlorie: setCustomScaler requested: %s\n", target);
+    pthread_mutex_lock(&stateLock);
+    if (strncmp(requestedScaler, target, sizeof(requestedScaler)) != 0) {
+        strncpy(requestedScaler, target, sizeof(requestedScaler) - 1);
+        requestedScaler[sizeof(requestedScaler) - 1] = '\0';
+        scalerChanged = true;
+    }
+    if (state)
+        state->drawRequested = true;
+    pthread_cond_signal(stateCond);
+    pthread_mutex_unlock(&stateLock);
 }
 
 void Renderer::setSwapInterval(int interval) {
@@ -1335,9 +1351,10 @@ void Renderer::drawRegion(GLuint id, float x0, float y0, float x1, float y1, flo
         x1, -y1, u1, v1,
     };
 
+    bool isRootDesktop = (srcW > 0.f && srcH > 0.f);
     GLuint prog = flip ? g_texture_program_bgra : g_texture_program;
     GLuint p = flip ? gv_pos_bgra : gv_pos, c = flip ? gv_coords_bgra : gv_coords;
-    if (customShaderLoaded && (flip ? progCustomBgra : progCustom)) {
+    if (customShaderLoaded && isRootDesktop && (flip ? progCustomBgra : progCustom)) {
         prog = flip ? progCustomBgra : progCustom;
         p = 0;
         c = 1;
@@ -1348,7 +1365,7 @@ void Renderer::drawRegion(GLuint id, float x0, float y0, float x1, float y1, flo
     if (id)
         glBindTexture(GL_TEXTURE_2D, id);
 
-    if (customShaderLoaded && srcW > 0.f && srcH > 0.f) {
+    if (customShaderLoaded && isRootDesktop) {
         GLint locTex = glGetUniformLocation(prog, "texture");
         if (locTex >= 0) glUniform1i(locTex, 0);
         GLint locTs = glGetUniformLocation(prog, "u_tex_size");
@@ -1359,10 +1376,14 @@ void Renderer::drawRegion(GLuint id, float x0, float y0, float x1, float y1, flo
         if (locDs >= 0) glUniform2f(locDs, dstW > 0.f ? dstW : srcW, dstH > 0.f ? dstH : srcH);
         GLint locSharp = glGetUniformLocation(prog, "u_sharpness");
         if (locSharp >= 0) glUniform1f(locSharp, 0.8f);
+
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    } else {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filtering);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filtering);
     }
 
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filtering);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filtering);
     glVertexAttribPointer(p, 2, GL_FLOAT, GL_FALSE, 16, coords);
     glVertexAttribPointer(c, 2, GL_FLOAT, GL_FALSE, 16, &coords[2]);
     glEnableVertexAttribArray(p);
@@ -1370,37 +1391,85 @@ void Renderer::drawRegion(GLuint id, float x0, float y0, float x1, float y1, flo
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4); checkGlError();
 }
 
-void Renderer::checkCustomShader() {
-    bool triggerReload = false;
-
-    if (shaderInotifyFd < 0) {
-        shaderInotifyFd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-        if (shaderInotifyFd >= 0) {
-            mkdir("/data/data/com.termux/files/home/shaders", 0755);
-            shaderInotifyWd = inotify_add_watch(shaderInotifyFd,
-                "/data/data/com.termux/files/home/shaders",
-                IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVED_TO | IN_MOVED_FROM | IN_CLOSE_WRITE);
-            mkdir("/data/data/com.termux/files/home/.config/termux-x11", 0755);
-            inotify_add_watch(shaderInotifyFd,
-                "/data/data/com.termux/files/home/.config/termux-x11",
-                IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVED_TO | IN_MOVED_FROM | IN_CLOSE_WRITE);
-        }
-        triggerReload = true; // Initial probe on startup
-    } else {
-        char eventBuf[sizeof(struct inotify_event) + 256];
-        ssize_t n = read(shaderInotifyFd, eventBuf, sizeof(eventBuf));
-        if (n > 0) {
-            triggerReload = true;
-        }
+static GLuint compileScalerVariant(const char* vertexSrc, const char* fragmentSrc, bool swizzleBgra) {
+    if (!swizzleBgra) {
+        return createProgram(vertexSrc, fragmentSrc);
     }
+    size_t len = strlen(fragmentSrc);
+    char* bgraSrc = (char*) malloc(len + 128);
+    if (!bgraSrc) return 0;
+    snprintf(bgraSrc, len + 128, "#define BGRA_INPUT 1\n#define SWIZZLE .bgra\n%s", fragmentSrc);
+    GLuint prog = createProgram(vertexSrc, bgraSrc);
+    free(bgraSrc);
+    return prog;
+}
 
-    if (!triggerReload && (customShaderCheckCounter++ & 63) == 0) {
-        triggerReload = true;
-    }
+void Renderer::applyScalerOnRendererThread() {
+    char target[32];
+    pthread_mutex_lock(&stateLock);
+    strncpy(target, requestedScaler, sizeof(target) - 1);
+    target[sizeof(target) - 1] = '\0';
+    scalerChanged = false;
+    pthread_mutex_unlock(&stateLock);
 
-    if (!triggerReload)
+    loge("Xlorie: Applying scaler on render thread: %s (current: %s)\n", target, currentScaler);
+
+    if (strcmp(target, "off") == 0) {
+        if (customShaderLoaded) {
+            loge("Xlorie: Scaler disabled, reverting to default GLES pipeline\n");
+            if (progCustom && progCustom != g_texture_program) glDeleteProgram(progCustom);
+            if (progCustomBgra && progCustomBgra != g_texture_program_bgra && progCustomBgra != progCustom)
+                glDeleteProgram(progCustomBgra);
+            progCustom = 0;
+            progCustomBgra = 0;
+            customShaderLoaded = false;
+            customShaderMtime = 0;
+        }
+        strncpy(currentScaler, "off", sizeof(currentScaler));
         return;
+    }
 
+    const char* src = nullptr;
+    if (strcmp(target, "fsr") == 0) {
+        src = BUILTIN_SHADER_FSR;
+    } else if (strcmp(target, "bicas") == 0) {
+        src = BUILTIN_SHADER_BICAS;
+    } else if (strcmp(target, "sgsr") == 0) {
+        src = BUILTIN_SHADER_SGSR;
+    } else if (strcmp(target, "nis") == 0) {
+        src = BUILTIN_SHADER_NIS;
+    } else if (strcmp(target, "rcas") == 0) {
+        src = BUILTIN_SHADER_RCAS;
+    } else if (strcmp(target, "lanczos") == 0) {
+        src = BUILTIN_SHADER_LANCZOS;
+    }
+
+    if (src) {
+        GLuint pRgba = compileScalerVariant(vertexShaderSrc, src, false);
+        GLuint pBgra = compileScalerVariant(vertexShaderSrc, src, true);
+        if (pRgba && pBgra) {
+            if (progCustom && progCustom != g_texture_program) glDeleteProgram(progCustom);
+            if (progCustomBgra && progCustomBgra != g_texture_program_bgra && progCustomBgra != progCustom)
+                glDeleteProgram(progCustomBgra);
+            progCustom = pRgba;
+            progCustomBgra = pBgra;
+            customShaderLoaded = true;
+            strncpy(currentScaler, target, sizeof(currentScaler));
+            loge("Xlorie: Successfully activated built-in scaler: %s (RGBA prog %u, BGRA prog %u)\n",
+                 target, pRgba, pBgra);
+        } else {
+            loge("Xlorie: Failed to compile built-in scaler: %s\n", target);
+            if (pRgba) glDeleteProgram(pRgba);
+            if (pBgra) glDeleteProgram(pBgra);
+        }
+        return;
+    }
+
+    // Otherwise, check custom external shader file
+    checkCustomShaderFile();
+}
+
+void Renderer::checkCustomShaderFile() {
     static const char* const customShaderPaths[] = {
         "/sdcard/Download/termux_upscaler.glsl",
         "/sdcard/termux_upscaler.glsl",
@@ -1424,7 +1493,7 @@ void Renderer::checkCustomShader() {
 
     if (!foundPath) {
         if (customShaderLoaded) {
-            log("Xlorie: custom shader removed, reverting to standard pipeline\n");
+            loge("Xlorie: Custom shader file removed, reverting to standard pipeline\n");
             if (progCustom && progCustom != g_texture_program) glDeleteProgram(progCustom);
             if (progCustomBgra && progCustomBgra != g_texture_program_bgra && progCustomBgra != progCustom)
                 glDeleteProgram(progCustomBgra);
@@ -1432,6 +1501,7 @@ void Renderer::checkCustomShader() {
             progCustomBgra = 0;
             customShaderLoaded = false;
             customShaderMtime = 0;
+            strncpy(currentScaler, "off", sizeof(currentScaler));
         }
         return;
     }
@@ -1440,7 +1510,10 @@ void Renderer::checkCustomShader() {
         return;
 
     FILE* f = fopen(foundPath, "rb");
-    if (!f) return;
+    if (!f) {
+        loge("Xlorie: Failed to open custom shader file %s (errno %d)\n", foundPath, errno);
+        return;
+    }
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -1452,22 +1525,16 @@ void Renderer::checkCustomShader() {
     src[len] = '\0';
     fclose(f);
 
-    GLuint newProg = createProgram(vertexShaderSrc, src);
-    if (!newProg) {
-        loge("Xlorie: failed to compile custom shader from %s\n", foundPath);
-        free(src);
+    GLuint newProg = compileScalerVariant(vertexShaderSrc, src, false);
+    GLuint newProgBgra = compileScalerVariant(vertexShaderSrc, src, true);
+    free(src);
+
+    if (!newProg || !newProgBgra) {
+        loge("Xlorie: Failed to compile custom shader file from %s\n", foundPath);
+        if (newProg) glDeleteProgram(newProg);
+        if (newProgBgra) glDeleteProgram(newProgBgra);
         return;
     }
-
-    char* bgraSrc = (char*) malloc(len + 128);
-    GLuint newProgBgra = newProg;
-    if (bgraSrc) {
-        snprintf(bgraSrc, len + 128, "#define BGRA_INPUT 1\n#define SWIZZLE .bgra\n%s", src);
-        GLuint pBgra = createProgram(vertexShaderSrc, bgraSrc);
-        if (pBgra) newProgBgra = pBgra;
-        free(bgraSrc);
-    }
-    free(src);
 
     if (progCustom && progCustom != g_texture_program) glDeleteProgram(progCustom);
     if (progCustomBgra && progCustomBgra != g_texture_program_bgra && progCustomBgra != progCustom)
@@ -1477,7 +1544,22 @@ void Renderer::checkCustomShader() {
     progCustomBgra = newProgBgra;
     customShaderLoaded = true;
     customShaderMtime = st.st_mtime;
-    loge("Xlorie: loaded and compiled custom shader from %s (mtime %ld)\n", foundPath, (long) customShaderMtime);
+    strncpy(currentScaler, "custom", sizeof(currentScaler));
+    loge("Xlorie: Loaded and compiled custom shader from %s (mtime %ld, RGBA %u, BGRA %u)\n",
+         foundPath, (long) customShaderMtime, progCustom, progCustomBgra);
+}
+
+void Renderer::checkCustomShader() {
+    if (scalerChanged || strcmp(requestedScaler, currentScaler) != 0) {
+        applyScalerOnRendererThread();
+        return;
+    }
+
+    if (strcmp(currentScaler, "custom") == 0) {
+        if ((customShaderCheckCounter++ & 63) == 0) {
+            checkCustomShaderFile();
+        }
+    }
 }
 
 void Renderer::drawCursor(float displayWidth, float displayHeight, float sourceLeft, float sourceTop, float cursorX, float cursorY) {
