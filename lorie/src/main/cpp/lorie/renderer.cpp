@@ -1076,6 +1076,11 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
 
     checkCustomShader();
 
+    float rSrcW = (desc->type == LORIEBUFFER_FD) ? (float) desc->stride : (float) desc->width;
+    float rSrcH = (float) desc->height;
+    float rDstW = (float) renderViewportW;
+    float rDstH = (float) renderViewportH;
+
     LorieBuffer_bindTexture(buffer);
     if (desc->type == LORIEBUFFER_FD)
         xfactor = (float) desc->width/(float) desc->stride;
@@ -1083,7 +1088,8 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
                sourceLeft / (float) desc->width * xfactor, sourceTop / (float) desc->height,
                (sourceLeft + sourceWidth) / (float) desc->width * xfactor,
                (sourceTop + sourceHeight) / (float) desc->height,
-               LorieBuffer_isRgba(buffer));
+               LorieBuffer_isRgba(buffer),
+               rSrcW, rSrcH, rDstW, rDstH);
     fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, nullptr);
     glFlush();
 
@@ -1318,7 +1324,7 @@ static GLuint createProgram(const char* p_vertex_source, const char* p_fragment_
     return 0;
 }
 
-void Renderer::drawRegion(GLuint id, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, uint8_t flip) {
+void Renderer::drawRegion(GLuint id, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, uint8_t flip, float srcW, float srcH, float dstW, float dstH) {
     float coords[16] = {
         x0, -y0, u0, v0,
         x1, -y0, u1, v0,
@@ -1338,6 +1344,19 @@ void Renderer::drawRegion(GLuint id, float x0, float y0, float x1, float y1, flo
     glUseProgram(prog);
     if (id)
         glBindTexture(GL_TEXTURE_2D, id);
+
+    if (customShaderLoaded && srcW > 0.f && srcH > 0.f) {
+        GLint locTex = glGetUniformLocation(prog, "texture");
+        if (locTex >= 0) glUniform1i(locTex, 0);
+        GLint locTs = glGetUniformLocation(prog, "u_tex_size");
+        if (locTs >= 0) glUniform2f(locTs, srcW, srcH);
+        GLint locTxs = glGetUniformLocation(prog, "u_texel_size");
+        if (locTxs >= 0) glUniform2f(locTxs, 1.0f / srcW, 1.0f / srcH);
+        GLint locDs = glGetUniformLocation(prog, "u_dst_size");
+        if (locDs >= 0) glUniform2f(locDs, dstW > 0.f ? dstW : srcW, dstH > 0.f ? dstH : srcH);
+        GLint locSharp = glGetUniformLocation(prog, "u_sharpness");
+        if (locSharp >= 0) glUniform1f(locSharp, 0.8f);
+    }
 
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filtering);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filtering);
@@ -1376,7 +1395,6 @@ void Renderer::checkCustomShader() {
         "/data/data/com.termux/files/home/shaders/current.glsl",
         "/data/data/com.termux/files/home/shaders/upscaler.glsl",
         "/data/data/com.termux/files/home/shaders/upscaler.frag",
-        "/data/data/com.termux/files/home/shaders/sgsr.glsl",
         "/data/data/com.termux/files/home/.config/termux-x11/shaders/upscaler.frag",
         "/data/data/com.termux/files/home/.config/termux-x11/upscaler.glsl",
         "/sdcard/termux-x11/shaders/upscaler.frag",
