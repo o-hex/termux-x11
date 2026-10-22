@@ -566,6 +566,7 @@ static jobject getXConnection(JNIEnv *env, __unused jobject cls) {
     jclass ParcelFileDescriptorClass = env->FindClass("android/os/ParcelFileDescriptor");
     jmethodID adoptFd = env->GetStaticMethodID(ParcelFileDescriptorClass, "adoptFd", "(I)Landroid/os/ParcelFileDescriptor;");
     socketpair(AF_UNIX, SOCK_STREAM, 0, client);
+    fcntl(client[1], F_SETFL, fcntl(client[1], F_GETFL, 0) | O_NONBLOCK);
     QueueWorkProc(+[](__unused ClientPtr pClient, void *closure) -> Bool {
         InputThreadRegisterDev((int) (int64_t) closure, handleLorieEvents, nullptr);
         conn_fd = (int) (int64_t) closure;
