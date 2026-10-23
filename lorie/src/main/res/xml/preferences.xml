@@ -38,6 +38,8 @@
         <SwitchPreferenceCompat app:key="tapToMove" app:defaultValue="true" />
         <SwitchPreferenceCompat app:key="ignoreGamepadEvents" app:defaultValue="false" />
         <SwitchPreferenceCompat app:key="zoomFollowsCursor" app:defaultValue="true" />
+        <SwitchPreferenceCompat app:key="enablePalmRejection" app:defaultValue="true" app:title="@string/lorie_pref_enablePalmRejection" app:summary="@string/lorie_pref_enablePalmRejection_summary" />
+        <ListPreference app:key="palmRejectionMode" app:defaultValue="stylus_and_area" app:entries="@array/palmRejectionEntries" app:entryValues="@array/palmRejectionValues" app:title="@string/lorie_pref_palmRejectionMode" app:useSimpleSummaryProvider="true" />
     </PreferenceScreen>
     <PreferenceScreen app:key="kbd">
         <SwitchPreferenceCompat app:key="showAdditionalKbd" app:defaultValue="true" />

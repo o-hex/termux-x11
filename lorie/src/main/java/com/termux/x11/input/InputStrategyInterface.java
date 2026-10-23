@@ -196,6 +196,7 @@ public interface InputStrategyInterface {
                 case MotionEvent.ACTION_POINTER_DOWN:
                     mSingleFinger = false;
                     // fall through
+                case MotionEvent.ACTION_CANCEL:
                 case MotionEvent.ACTION_UP:
                     if (mHeldButton != InputStub.BUTTON_UNDEFINED) {
                         mInjector.sendMouseUp(mHeldButton, false);
@@ -273,7 +274,8 @@ public interface InputStrategyInterface {
 
         @Override
         public void onMotionEvent(MotionEvent event) {
-            if (event.getActionMasked() == MotionEvent.ACTION_UP && mHeldButton != InputStub.BUTTON_UNDEFINED) {
+            int action = event.getActionMasked();
+            if ((action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) && mHeldButton != InputStub.BUTTON_UNDEFINED) {
                 mInjector.sendMouseUp(mHeldButton, true);
                 mHeldButton = InputStub.BUTTON_UNDEFINED;
             }
