@@ -421,6 +421,7 @@ static bool cpuAndGpuShareAhbMemory(EGLDisplay egl_display) {
     EGLImageKHR image = EGL_NO_IMAGE_KHR;
     GLuint texture = 0, fbo = 0;
     volatile uint32_t *pixels = nullptr;
+    uint32_t gpuPixel = 0;
     bool result = true;
 
     if (AHardwareBuffer_allocate(&desc, &buf) != 0 || !buf)
@@ -456,7 +457,7 @@ static bool cpuAndGpuShareAhbMemory(EGLDisplay egl_display) {
     if (AHardwareBuffer_lock(buf, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
                              -1, nullptr, (void **) &pixels) != 0 || !pixels)
         goto out;
-    uint32_t gpuPixel = pixels[0];
+    gpuPixel = pixels[0];
     AHardwareBuffer_unlock(buf, nullptr);
     pixels = nullptr;
 
