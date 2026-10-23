@@ -113,4 +113,24 @@
         <item>left</item>
         <item>right</item>
     </string-array>
+    <string-array name="rendererScalerEntries">
+        <item>Off (Default / Bilinear)</item>
+        <item>AMD FSR 1.0 (EASU + RCAS)</item>
+        <item>Bicubic + CAS (BiCAS)</item>
+        <item>Qualcomm SGSR</item>
+        <item>NVIDIA Image Scaling (NIS)</item>
+        <item>RCAS Sharpening</item>
+        <item>EWA Lanczos</item>
+        <item>Custom Shader File</item>
+    </string-array>
+    <string-array name="rendererScalerValues">
+        <item>off</item>
+        <item>fsr</item>
+        <item>bicas</item>
+        <item>sgsr</item>
+        <item>nis</item>
+        <item>rcas</item>
+        <item>lanczos</item>
+        <item>custom</item>
+    </string-array>
 </resources>
