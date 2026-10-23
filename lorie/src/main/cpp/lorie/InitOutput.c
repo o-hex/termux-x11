@@ -22,6 +22,8 @@
 #include <X11/X.h>
 #include <X11/Xmd.h>
 #include <sys/wait.h>
+#include <sys/syscall.h>
+#include <linux/futex.h>
 #include <present.h>
 #include <sys/mman.h>
 #include <dri3.h>
@@ -103,6 +105,8 @@ typedef struct {
 
     uint64_t gpuCopySerialCounter;
     uint64_t rootGpuCopyPending;
+
+    Bool requestLockHeld;
 } lorieScreenInfo;
 
 ScreenPtr pScreenPtr;
@@ -505,7 +509,7 @@ static void lorieSetCursor(DeviceIntPtr pDev, unused ScreenPtr pScr, CursorPtr p
         // We do not have enough memory allocated for such a big cursor, let's display default "X" cursor
         pCurs = rootCursor;
 
-    lorie_mutex_lock(&pvfb->state->cursor.lock, &pvfb->state->cursor.lockingPid);
+    lorie_mutex_lock(&pvfb->state->cursor.lock, &pvfb->state->cursor.lockingPid, conn_fd);
     if (pCurs && bits) {
         pvfb->state->cursor.xhot = bits->xhot;
         pvfb->state->cursor.yhot = bits->yhot;
@@ -539,17 +543,60 @@ static miPointerScreenFuncRec loriePointerCursorFuncs = {
 
 static void loriePerformVblanks(void);
 
+static void lorieRequestLockTake(void) {
+    if (pvfb->requestLockHeld)
+        return;
+    lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid, conn_fd);
+    pvfb->requestLockHeld = TRUE;
+}
+
+static void lorieRequestLockRelease(void) {
+    if (!pvfb->requestLockHeld)
+        return;
+    pvfb->requestLockHeld = FALSE;
+    lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
+
+    if (!pvfb->state->rendererWaiting)
+        return;
+
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_nsec += 100000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    for (uint32_t v; (v = __atomic_load_n(&pvfb->state->rendererWaiting, __ATOMIC_ACQUIRE)) && lorieConnectionAlive(conn_fd); )
+        if (syscall(SYS_futex, &pvfb->state->rendererWaiting, FUTEX_WAIT_BITSET, v, &deadline, NULL, FUTEX_BITSET_MATCH_ANY) == -1 && errno == ETIMEDOUT)
+            break;
+
+    pvfb->state->rendererWaiting = FALSE;
+}
+
+void ddxRequestDone(void) {
+    if (!pvfb || !pvfb->state)
+        return;
+
+    lorieRequestLockRelease();
+}
+
+static void lorieBlockHandler(__unused void *data, __unused void *timeout) {
+    ddxRequestDone();
+}
+
 static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     int status, nonEmpty;
     LoriePixmapPriv* priv;
     PixmapPtr root = pScreenPtr && pScreenPtr->root ? pScreenPtr->GetWindowPixmap(pScreenPtr->root) : NULL;
 
+    lorieRequestLockRelease();
     pvfb->current_msc++;
     loriePerformVblanks();
 
     pvfb->state->waitForNextFrame = false;
 
-    if (!lorieConnectionAlive() || !pvfb->state->surfaceAvailable)
+    if (!lorieConnectionAlive(conn_fd) || !pvfb->state->surfaceAvailable)
         return TRUE;
 
     nonEmpty = RegionNotEmpty(DamageRegion(pvfb->damage));
@@ -621,6 +668,7 @@ static Bool lorieCreateScreenResources(ScreenPtr pScreen) {
     DamageRegister(&(*pScreen->GetScreenPixmap)(pScreen)->drawable, pvfb->damage);
     pvfb->fpsTimer = TimerSet(NULL, 0, 5000, lorieFramecounter, pScreen);
     TimerSet(NULL, 0, 1000, lorieHeartbeat, NULL);
+    RegisterBlockAndWakeupHandlers(lorieBlockHandler, (ServerWakeupHandlerProcPtr) NoopDDA, NULL);
 
     lorieRegisterBuffer(LORIE_BUFFER_FROM_PIXMAP(pScreenPtr->devPrivate));
 
@@ -970,7 +1018,7 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
         return FALSE;
     }
 
-    if (!lorieConnectionAlive() || !lorieRendererAvailable()) {
+    if (!lorieConnectionAlive(conn_fd) || !lorieRendererAvailable()) {
         // No renderer to drain the queue, so fall back to CPU copy.
         gpuCopyAttempts++;
         gpuCopyFallbackOther++;
@@ -1083,7 +1131,7 @@ Bool lorieGpuCopyIsDone(uint64_t serial) {
 void lorieGpuCopyFlush(void) {
     uint64_t serial = pvfb->gpuCopySerialCounter;
     for (int i = 0; i < 500 && !lorieGpuCopyIsDone(serial); i++) {
-        if (!lorieConnectionAlive() || !lorieRendererAvailable())
+        if (!lorieConnectionAlive(conn_fd) || !lorieRendererAvailable())
             return;
         usleep(200);
     }
@@ -1237,10 +1285,19 @@ static inline __always_inline Bool lorieNeedsGpuLock(PixmapPtr pPix, LoriePixmap
            LorieBuffer_hasGpuCopyPending(priv->buffer);
 }
 
+// Writes to the screen pixmap keep the lock until the end of the request instead of dropping it in lorieFinishAccess.
+static inline __always_inline Bool lorieKeepLockUntilRequestEnd(PixmapPtr pPix, int index) {
+    return index == EXA_PREPARE_DEST && pScreenPtr->GetScreenPixmap(pScreenPtr) == pPix;
+}
+
 Bool loriePrepareAccess(PixmapPtr pPix, int index) {
     LoriePixmapPriv *priv = exaGetPixmapDriverPrivate(pPix);
-    if (lorieNeedsGpuLock(pPix, priv, index))
-        lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
+    if (lorieNeedsGpuLock(pPix, priv, index)) {
+        if (lorieKeepLockUntilRequestEnd(pPix, index))
+            lorieRequestLockTake();
+        else
+            lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid, conn_fd);
+    }
 
     if (priv->lockDepth == 0) {
         if (!priv->locked && !priv->mem) {
@@ -1272,7 +1329,7 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
 
 void lorieFinishAccess(PixmapPtr pPix, int index) {
     LoriePixmapPriv *priv = exaGetPixmapDriverPrivate(pPix);
-    if (lorieNeedsGpuLock(pPix, priv, index))
+    if (lorieNeedsGpuLock(pPix, priv, index) && !lorieKeepLockUntilRequestEnd(pPix, index))
         lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
 
     if (priv->dmaBufAccessDepth && !--priv->dmaBufAccessDepth) {
