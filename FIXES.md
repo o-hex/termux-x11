@@ -136,6 +136,19 @@
 
 ---
 
+### Fix 11: Upstream Master Integration (Twaik presentation & lock fixes)
+* **Root Window Lock Duration (`701ecd5` & `09194f2`)**:
+  * `ExaCheckCopyWindow` in `exa/exa_unaccel.c` was preparing the root window as `EXA_PREPARE_SRC` during window moves/scrolls, bypassing `lorieNeedsGpuLock()`. Fixed by changing to `EXA_PREPARE_DEST`.
+  * Added `lorieKeepLockUntilRequestEnd()`: Destination locks on the root window are now held across the entire X11 request until `ddxRequestDone()` in `dix/dispatch.c`, eliminating "ghost window" replicas caused by GLES renderer sampling mid-draw.
+* **Robust Mutex `connFd` Verification (`7e5f5c5`)**:
+  * `lorie_mutex_lock` in `lorie.h` timed out after 33ms and checked `lorieConnectionAlive()`. In the companion app renderer process, `conn_fd` was uninitialized (-1), causing it to believe the X server died and re-initialize the mutex while Xorg was actively writing. Fixed by passing `connFd` explicitly.
+* **Linux Kernel Futex Lock Handoff (`9ebfa66`)**:
+  * Replaced `sched_yield()` + `usleep(20)` polling loop in `lorieRequestLockRelease()` with `SYS_futex` (`FUTEX_WAIT_BITSET` / `FUTEX_WAKE`), cutting CPU overhead.
+* **Process-Local Lock State Leakage (`3960a15`)**:
+  * `buffer.locked` and `buffer.lockedData` are reset upon receiving an AHB handle across UNIX sockets, preventing sender pointer leakage into the receiver.
+
+---
+
 ## 3. How to Trigger Clean CI Builds
 
 Builds are executed via GitHub Actions on the `o-hex/termux-x11` fork:
