@@ -12,7 +12,9 @@
 #include <math.h>
 #include <pixman.h>
 #include <stdbool.h>
+#include <linux/dma-buf.h>
 #include <linux/memfd.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -40,6 +42,7 @@ struct LorieBuffer {
     int fd;
     size_t size;
     off_t offset;
+    int8_t dmaBufSyncSupport;
 
     GLuint id;
     EGLImage image;
@@ -47,6 +50,46 @@ struct LorieBuffer {
 
     int32_t gpuCopyPending;
 };
+
+enum {
+    DMA_BUF_SYNC_UNKNOWN = 0,
+    DMA_BUF_SYNC_SUPPORTED = 1,
+    DMA_BUF_SYNC_UNSUPPORTED = -1,
+};
+
+static bool dmaBufCpuAccessBegin(LorieBuffer *buffer, bool write) {
+    if (!buffer || buffer->desc.type != LORIEBUFFER_FD ||
+        buffer->dmaBufSyncSupport == DMA_BUF_SYNC_UNSUPPORTED)
+        return false;
+
+    struct dma_buf_sync sync = {
+        .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ | (write ? DMA_BUF_SYNC_WRITE : 0),
+    };
+    if (ioctl(buffer->fd, DMA_BUF_IOCTL_SYNC, &sync) == 0) {
+        buffer->dmaBufSyncSupport = DMA_BUF_SYNC_SUPPORTED;
+        return true;
+    }
+
+    if (buffer->dmaBufSyncSupport == DMA_BUF_SYNC_UNKNOWN &&
+        (errno == ENOTTY || errno == EINVAL || errno == ENOSYS))
+        buffer->dmaBufSyncSupport = DMA_BUF_SYNC_UNSUPPORTED;
+    return false;
+}
+
+static void dmaBufCpuAccessEnd(LorieBuffer *buffer, bool write) {
+    struct dma_buf_sync sync = {
+        .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ | (write ? DMA_BUF_SYNC_WRITE : 0),
+    };
+    ioctl(buffer->fd, DMA_BUF_IOCTL_SYNC, &sync);
+}
+
+__LIBC_HIDDEN__ bool LorieBuffer_cpuAccessBegin(LorieBuffer *buffer, bool write) {
+    return dmaBufCpuAccessBegin(buffer, write);
+}
+
+__LIBC_HIDDEN__ void LorieBuffer_cpuAccessEnd(LorieBuffer *buffer, bool write) {
+    dmaBufCpuAccessEnd(buffer, write);
+}
 
 void LorieBuffer_gpuCopyPendingInc(LorieBuffer* buffer) {
     if (buffer)
@@ -87,6 +130,19 @@ static int memfd_create(const char *name, unsigned int flags) {
 static inline size_t alignToPage(size_t size) {
     size_t page_size = sysconf(_SC_PAGE_SIZE);
     return (size + page_size - 1) & ~(page_size - 1);
+}
+
+// A pixmap's buffer can end up exported to a foreign GPU consumer (DRI3 fds_from_pixmap) that
+// reads the raw dma-buf directly, bypassing AHardwareBuffer's own implicit-sync bookkeeping.
+// Requesting an explicit release fence from AHardwareBuffer_unlock and waiting on it here, instead
+// of letting AHardwareBuffer_unlock(..., NULL) block internally, exercises the same kernel-level
+// dma-buf fence a foreign consumer would itself wait on.
+static void waitFence(int32_t fence) {
+    if (fence < 0)
+        return;
+    struct pollfd pfd = { .fd = fence, .events = POLLIN };
+    poll(&pfd, 1, -1);
+    close(fence);
 }
 
 #pragma clang diagnostic push
@@ -203,7 +259,8 @@ __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_allocate(int32_t width, int32_t height,
         if (fd < 0)
             return NULL;
     } else if (type == LORIEBUFFER_AHARDWAREBUFFER) {
-        AHardwareBuffer_Desc desc = { .width = width, .height = height, .format = format, .layers = 1,
+        int32_t aligned_height = (height + 3) & ~3;
+        AHardwareBuffer_Desc desc = { .width = width, .height = aligned_height, .format = format, .layers = 1,
                 .usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER };
         int err = -1;
         if (__builtin_available(android 26, *))
@@ -227,7 +284,9 @@ __LIBC_HIDDEN__ void LorieBuffer_convert(LorieBuffer* buffer, int8_t type, int8_
     void *data;
     if (!buffer || buffer->desc.type != LORIEBUFFER_REGULAR
         || (type != LORIEBUFFER_FD && type != LORIEBUFFER_AHARDWAREBUFFER)
-        || (format != AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM && format != AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM))
+        || (format != AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM
+            && format != AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM
+            && format != AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM))
         return;
 
     if (type == LORIEBUFFER_FD) {
@@ -255,12 +314,18 @@ __LIBC_HIDDEN__ void LorieBuffer_convert(LorieBuffer* buffer, int8_t type, int8_
         buffer->lockedData = NULL;
         buffer->locked = 0;
     } else {
+        int32_t aligned_height = (buffer->desc.height + 3) & ~3;
         AHardwareBuffer *b = NULL;
-        AHardwareBuffer_Desc desc = { .width = buffer->desc.width, .height = buffer->desc.height, .format = format, .layers = 1,
+        AHardwareBuffer_Desc desc = { .width = buffer->desc.width, .height = aligned_height, .format = format, .layers = 1,
                 .usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER };
         int err = -1;
         if (__builtin_available(android 26, *))
             err = AHardwareBuffer_allocate(&desc, &b);
+        if (err != 0 && format == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM) {
+            desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+            if (__builtin_available(android 26, *))
+                err = AHardwareBuffer_allocate(&desc, &b);
+        }
         if (err != 0)
             return;
 
@@ -269,13 +334,15 @@ __LIBC_HIDDEN__ void LorieBuffer_convert(LorieBuffer* buffer, int8_t type, int8_
 
         if (__builtin_available(android 26, *)) {
             if (AHardwareBuffer_lock(b, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, NULL, &data) == 0) {
+                int32_t fence = -1;
                 pixman_blt(buffer->desc.data, data, buffer->desc.stride, (int) desc.stride, 32, 32, 0, 0, 0, 0, buffer->desc.width, buffer->desc.height);
-                AHardwareBuffer_unlock(b, NULL);
+                AHardwareBuffer_unlock(b, &fence);
+                waitFence(fence);
             }
         }
 
         buffer->desc.type = type;
-        buffer->desc.format = format;
+        buffer->desc.format = desc.format;
         buffer->desc.stride = (int32_t) desc.stride;
         buffer->desc.buffer = b;
         free(buffer->desc.data);
@@ -358,8 +425,11 @@ __LIBC_HIDDEN__ int LorieBuffer_unlock(LorieBuffer* buffer) {
     }
 
     if (buffer->desc.type == LORIEBUFFER_AHARDWAREBUFFER) {
-        if (__builtin_available(android 26, *))
-            ret = AHardwareBuffer_unlock(buffer->desc.buffer, NULL);
+        if (__builtin_available(android 26, *)) {
+            int32_t fence = -1;
+            ret = AHardwareBuffer_unlock(buffer->desc.buffer, &fence);
+            waitFence(fence);
+        }
     }
 
     buffer->lockedData = NULL;
@@ -396,6 +466,7 @@ __LIBC_HIDDEN__ void LorieBuffer_recvHandleFromUnixSocket(int socketFd, LorieBuf
     buffer.image = NULL; // Only for process-local use
     buffer.locked = false;
     buffer.lockedData = NULL;
+    buffer.dmaBufSyncSupport = DMA_BUF_SYNC_UNKNOWN;
     if (buffer.desc.type == LORIEBUFFER_FD) {
         size_t size = buffer.desc.stride * buffer.desc.height * sizeof(uint32_t);
         buffer.fd = ancil_recv_fd(socketFd);
@@ -466,8 +537,12 @@ __LIBC_HIDDEN__ void LorieBuffer_bindTexture(LorieBuffer *buffer) {
         return;
 
     glBindTexture(GL_TEXTURE_2D, buffer->id);
-    if (buffer->desc.type == LORIEBUFFER_FD)
+    if (buffer->desc.type == LORIEBUFFER_FD) {
+        bool dmaBufRead = dmaBufCpuAccessBegin(buffer, false);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, buffer->desc.stride, buffer->desc.height, buffer->desc.format == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM ? GL_BGRA_EXT : GL_RGBA, GL_UNSIGNED_BYTE, buffer->desc.data);
+        if (dmaBufRead)
+            dmaBufCpuAccessEnd(buffer, false);
+    }
 }
 
 __LIBC_HIDDEN__ unsigned int LorieBuffer_getGLTextureId(LorieBuffer *buffer) {
@@ -506,6 +581,11 @@ int LorieBuffer_recvAHardwareBufferHandleFromUnixSocket(int socketFd, AHardwareB
     if (__builtin_available(android 26, *))
         return AHardwareBuffer_recvHandleFromUnixSocket(socketFd, outBuffer);
     return -ENOSYS;
+}
+
+__LIBC_HIDDEN__ void LorieBuffer_sendRawAHardwareBufferHandleToUnixSocket(AHardwareBuffer* buffer, int socketFd) {
+    if (__builtin_available(android 26, *))
+        AHardwareBuffer_sendHandleToUnixSocket(buffer, socketFd);
 }
 
 void LorieBuffer_describeAHardwareBuffer(AHardwareBuffer* buffer, AHardwareBuffer_Desc* outDesc) {

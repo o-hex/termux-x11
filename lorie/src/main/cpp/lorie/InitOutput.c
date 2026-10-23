@@ -14,6 +14,10 @@
 
 #include <sys/eventfd.h>
 #include <sys/errno.h>
+#include <sys/socket.h>
+#include <poll.h>
+#include <stdio.h>
+#include <string.h>
 #include <libxcvt/libxcvt.h>
 #include <X11/X.h>
 #include <X11/Xmd.h>
@@ -53,6 +57,18 @@ extern void android_shmem_sysv_shm_force(uint8_t enable);
 extern DeviceIntPtr lorieMouse, lorieKeyboard;
 
 #define CREATE_PIXMAP_USAGE_LORIEBUFFER_BACKED 5
+#define AHB_HANDSHAKE_TIMEOUT_MS 3000
+
+static int lorieWaitForSocketEvent(int fd, short events) {
+    struct pollfd descriptor = { .fd = fd, .events = events, .revents = 0 };
+    int result;
+    do {
+        result = poll(&descriptor, 1, AHB_HANDSHAKE_TIMEOUT_MS);
+    } while (result < 0 && errno == EINTR);
+
+    return result == 1 && (descriptor.revents & events) != 0 &&
+           (descriptor.revents & (POLLERR | POLLNVAL)) == 0;
+}
 
 struct vblank {
     struct xorg_list link;
@@ -115,6 +131,10 @@ static pthread_cond_t* volatile rendererCond = &rendererCondPlaceholder;
 typedef struct {
     LorieBuffer *buffer;
     bool flipped, wasLocked, imported, gpuOnly;
+    // Number of CPU accesses in progress that started a dma-buf sync, and whether one of them writes.
+    uint8_t dmaBufAccessDepth;
+    bool dmaBufAccessWrite;
+    uint8_t lockDepth;
     void *locked;
     void *mem;
 } LoriePixmapPriv;
@@ -130,11 +150,20 @@ static LorieBuffer *lorieEnsureGpuSampleable(PixmapPtr pixmap, int8_t type) {
 
     desc = LorieBuffer_description(priv->buffer);
     if (desc->type == LORIEBUFFER_REGULAR) {
-        LorieBuffer_convert(priv->buffer, type, AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM);
+        int8_t format = (pixmap->drawable.depth == 32)
+            ? AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM
+            : AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM;
+        LorieBuffer_convert(priv->buffer, type, format);
+        desc = LorieBuffer_description(priv->buffer);
         if (desc->type != LORIEBUFFER_REGULAR) {
-            // LorieBuffer_convert does not report status but it does not let the type change in the case of error.
+            // LorieBuffer_convert copied the pixels and unlocked the buffer.
+            // Reset priv->locked and pixmap->devPrivate.ptr so EXA PrepareAccess/FinishAccess
+            // properly lock and unlock the AHardwareBuffer on demand.
+            priv->locked = NULL;
+            priv->lockDepth = 0;
+            priv->wasLocked = FALSE;
             pScreenPtr->ModifyPixmapHeader(pixmap, 0, 0, 0, 0, desc->stride * 4, NULL);
-            LorieBuffer_lock(priv->buffer, &priv->locked);
+            pixmap->devPrivate.ptr = NULL;
         }
     }
 
@@ -797,8 +826,10 @@ static void lorieWorkingQueueCallback(int fd, int __unused ready, void __unused 
     eventfd_read(fd, &dummy);
 }
 
-void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d) {
+void lorieChoreographerFrameCallback(long t, AChoreographer* d) {
     AChoreographer_postFrameCallback(d, (AChoreographer_frameCallback) lorieChoreographerFrameCallback, d);
+    if (pvfb->state)
+        pvfb->state->lastVsyncNanos = t;
     if (pScreenPtr) {
         QueueWorkProc(lorieRedraw, NULL, NULL);
         lorieWakeServer();
@@ -820,6 +851,8 @@ static Bool lorieScreenInit(ScreenPtr pScreen, unused int argc, unused char **ar
     pScreen->whitePixel = 1;
 
     pvfb->vblank_interval = 1000000 / pvfb->root.framerate;
+    if (pvfb->state)
+        pvfb->state->vsyncIntervalNanos = (int64_t) pvfb->vblank_interval * 1000;
 
     if (FALSE
           || !miSetVisualTypesAndMasks(24, ((1 << TrueColor) | (1 << DirectColor)), 8, TrueColor, 0xFF0000, 0x00FF00, 0x0000FF)
@@ -873,6 +906,8 @@ void lorieConfigureNotify(int width, int height, int framerate, size_t name_size
         log(VERBOSE, "New reported framerate is %d", framerate);
         pvfb->root.framerate = framerate;
         pvfb->vblank_interval = 1000000 / pvfb->root.framerate;
+    if (pvfb->state)
+        pvfb->state->vsyncIntervalNanos = (int64_t) pvfb->vblank_interval * 1000;
     }
 }
 
@@ -1007,6 +1042,19 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     desc = LorieBuffer_description(srcBuffer);
     dstDesc = LorieBuffer_description(dstBuffer);
 
+    /* Transfer an idle CPU mapping back to the GPU before queuing the write. */
+    LoriePixmapPriv *dstPriv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(dst);
+    if (dstDesc->type == LORIEBUFFER_AHARDWAREBUFFER && dstPriv && dstPriv->locked) {
+        if (LorieBuffer_unlock(dstPriv->buffer) != 0) {
+            gpuCopyAttempts++;
+            gpuCopyFallbackOther++;
+            return FALSE;
+        }
+        dstPriv->locked = NULL;
+        dstPriv->wasLocked = false;
+        dst->devPrivate.ptr = NULL;
+    }
+
     if (update) {
         numRects = RegionNumRects(update);
         box = RegionRects(update);
@@ -1080,6 +1128,15 @@ Bool lorieGpuCopyIsDone(uint64_t serial) {
     return __atomic_load_n(&pvfb->state->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE) >= serial;
 }
 
+void lorieGpuCopyFlush(void) {
+    uint64_t serial = pvfb->gpuCopySerialCounter;
+    for (int i = 0; i < 500 && !lorieGpuCopyIsDone(serial); i++) {
+        if (!lorieConnectionAlive(conn_fd) || !lorieRendererAvailable())
+            return;
+        usleep(200);
+    }
+}
+
 Bool loriePixmapIsGpuOnly(PixmapPtr pixmap) {
     LoriePixmapPriv *priv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap);
     return priv && priv->gpuOnly;
@@ -1125,10 +1182,35 @@ void loriePresentAfterFlip(__unused RRCrtcPtr crtc, uint64_t event_id, uint64_t 
     // Since we do not invoke DRM API or anything similar we do not need to implement this as callback
     // For some reason calling present_event_notify in BlockHandler or as QueueWorkProc/eventfd callback
     // adds some delay which may be easily avoided this way.
+    // Dri3Open-IdleNotify-fix: notifying here releases the back buffer (IdleNotify) BEFORE the
+    // Android Choreographer has consumed/presented the frame. At high FPS (zero-copy DRI3/dmabuf,
+    // 1000+ FPS) the client rewrites the buffer while it is still on screen -> flicker/tearing.
+    // Defer the CompleteNotify/IdleNotify to the next lorieRedraw (next Android vsync) by queueing
+    // it in the vblank_queue, drained by loriePerformVblanks() on the next frame.
+    // TERMUX_X11_DEFER_AFTER_FLIP=0 restores the original immediate-notify behaviour (A/B testing).
     static BoxRec box = { 0, 0, 1, 1 }; // lorieRedraw only checks if it is empty or not.
     RegionReset(DamageRegion(pvfb->damage), &box);
-    pvfb->current_msc = min(pvfb->current_msc + 1, target_msc);
-    present_event_notify(event_id, ust, pvfb->current_msc);
+
+    char *deferEnv = getenv("TERMUX_X11_DEFER_AFTER_FLIP");
+    Bool defer = deferEnv ? atoi(deferEnv) != 0 : TRUE;
+
+    if (!defer) {
+        pvfb->current_msc = min(pvfb->current_msc + 1, target_msc);
+        present_event_notify(event_id, ust, pvfb->current_msc);
+        return;
+    }
+
+    struct vblank* vblank = calloc (1, sizeof (*vblank));
+    if (vblank) {
+        // Notify on the NEXT lorieRedraw (next Android vsync). current_msc+1 drains on the next
+        // frame, giving the display one vsync to consume the buffer before the client reuses it.
+        *vblank = (struct vblank) { .id = event_id, .msc = pvfb->current_msc + 1 };
+        xorg_list_add(&vblank->link, &pvfb->vblank_queue);
+    } else {
+        // Fallback: if we can not queue, notify now so the client is not stuck forever.
+        pvfb->current_msc = min(pvfb->current_msc + 1, target_msc);
+        present_event_notify(event_id, ust, pvfb->current_msc);
+    }
 }
 
 void loriePresentUnflip(__unused ScreenPtr screen, uint64_t event_id) {
@@ -1217,15 +1299,29 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
             lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid, conn_fd);
     }
 
-    if (!priv->locked && !priv->mem) {
-        int err = LorieBuffer_lock(priv->buffer, &priv->locked);
-        if (err) {
-            dprintf(2, "Failed to lock buffer, err %d\n", err);
-            return FALSE;
+    if (priv->lockDepth == 0) {
+        if (!priv->locked && !priv->mem) {
+            int err = LorieBuffer_lock(priv->buffer, &priv->locked);
+            if (err) {
+                dprintf(2, "Failed to lock buffer, err %d\n", err);
+                if (lorieNeedsGpuLock(pPix, priv, index))
+                    lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
+                return FALSE;
+            }
+            priv->wasLocked = FALSE;
+        } else
+            priv->wasLocked = TRUE;
+    }
+    priv->lockDepth++;
+
+    // Imported dma-bufs may be rendered into by another device, the CPU caches must be synced.
+    if (priv->buffer && !priv->mem) {
+        bool write = index == EXA_PREPARE_DEST || index == EXA_PREPARE_AUX_DEST;
+        if (priv->dmaBufAccessDepth || LorieBuffer_cpuAccessBegin(priv->buffer, write)) {
+            priv->dmaBufAccessDepth++;
+            priv->dmaBufAccessWrite |= write;
         }
-        priv->wasLocked = FALSE;
-    } else
-        priv->wasLocked = TRUE;
+    }
 
     pPix->devPrivate.ptr = priv->locked ?: priv->mem;
     return TRUE;
@@ -1236,10 +1332,17 @@ void lorieFinishAccess(PixmapPtr pPix, int index) {
     if (lorieNeedsGpuLock(pPix, priv, index) && !lorieKeepLockUntilRequestEnd(pPix, index))
         lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
 
-    if (!priv->wasLocked) {
-        LorieBuffer_unlock(priv->buffer);
-        priv->locked = NULL;
-        priv->wasLocked = FALSE;
+    if (priv->dmaBufAccessDepth && !--priv->dmaBufAccessDepth) {
+        LorieBuffer_cpuAccessEnd(priv->buffer, priv->dmaBufAccessWrite);
+        priv->dmaBufAccessWrite = false;
+    }
+
+    if (priv->lockDepth && !--priv->lockDepth) {
+        if (!priv->wasLocked) {
+            LorieBuffer_unlock(priv->buffer);
+            priv->locked = NULL;
+            pPix->devPrivate.ptr = NULL;
+        }
     }
 }
 
@@ -1259,6 +1362,7 @@ static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *
 #define check(cond, msg, ...) if ((cond)) fail(msg, ##__VA_ARGS__)
     const CARD64 AHARDWAREBUFFER_SOCKET_FD = 1255;
     const CARD64 AHARDWAREBUFFER_FLIPPED_SOCKET_FD = 1256;
+    const CARD64 AHARDWAREBUFFER_RGBA_SOCKET_FD = 1257;
     const CARD64 RAW_MMAPPABLE_FD = 1274;
     AHardwareBuffer_Desc desc = {0};
     AHardwareBuffer* buffer = NULL;
@@ -1267,6 +1371,7 @@ static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *
 
     check(num_fds > 1, "DRI3: More than 1 fd");
     check(modifier != RAW_MMAPPABLE_FD && modifier != AHARDWAREBUFFER_SOCKET_FD && modifier != AHARDWAREBUFFER_FLIPPED_SOCKET_FD &&
+          modifier != AHARDWAREBUFFER_RGBA_SOCKET_FD &&
           modifier != DRM_FORMAT_MOD_INVALID && modifier != DRM_FORMAT_MOD_LINEAR, "DRI3: Modifier is not RAW_MMAPPABLE_FD or AHARDWAREBUFFER_SOCKET_FD");
 
     pixmap = screen->CreatePixmap(screen, 0, 0, depth, 0);
@@ -1285,16 +1390,25 @@ static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *
         return pixmap;
     }
 
-    if (modifier == AHARDWAREBUFFER_SOCKET_FD || modifier == AHARDWAREBUFFER_FLIPPED_SOCKET_FD) {
+    if (modifier == AHARDWAREBUFFER_SOCKET_FD || modifier == AHARDWAREBUFFER_FLIPPED_SOCKET_FD ||
+        modifier == AHARDWAREBUFFER_RGBA_SOCKET_FD) {
         struct stat info;
         uint8_t buf = 1;
         int r;
+        ssize_t write_result;
 
         priv->flipped = modifier == AHARDWAREBUFFER_FLIPPED_SOCKET_FD;
         check(fstat(fds[0], &info) != 0, "DRI3: fstat failed: %s", strerror(errno));
         check(!S_ISSOCK(info.st_mode), "DRI3: modifier is AHARDWAREBUFFER_SOCKET_FD but fd is not a socket");
-        // Sending signal to other end of socket to send buffer.
-        check(write(fds[0], &buf, 1) != 1, "DRI3: AHARDWAREBUFFER_SOCKET_FD: failed to write to socket: %s", strerror(errno));
+        // Sending signal to other end of socket to send buffer with timeout.
+        check(!lorieWaitForSocketEvent(fds[0], POLLOUT),
+              "DRI3: AHARDWAREBUFFER_SOCKET_FD: timed out sending acknowledgement");
+        do {
+            write_result = write(fds[0], &buf, 1);
+        } while (write_result < 0 && errno == EINTR);
+        check(write_result != 1, "DRI3: AHARDWAREBUFFER_SOCKET_FD: failed to write to socket: %s", strerror(errno));
+        check(!lorieWaitForSocketEvent(fds[0], POLLIN),
+              "DRI3: AHARDWAREBUFFER_SOCKET_FD: timed out waiting for buffer handle");
         check((r = LorieBuffer_recvAHardwareBufferHandleFromUnixSocket(fds[0], &buffer)) != 0,
               "DRI3: AHARDWAREBUFFER_SOCKET_FD: failed to obtain AHardwareBuffer from socket: %d", r);
         check(!buffer, "DRI3: AHARDWAREBUFFER_SOCKET_FD: did not receive AHardwareSocket from buffer");
@@ -1303,6 +1417,9 @@ static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *
             && desc.format != AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM
             && desc.format != AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM,
             "DRI3: AHARDWAREBUFFER_SOCKET_FD: wrong format of AHardwareBuffer. Must be one of: AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM, AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM (stands for 5).");
+        check(desc.width < width || desc.height < height,
+              "DRI3: AHardwareBuffer %ux%u is smaller than pixmap %ux%u",
+              desc.width, desc.height, width, height);
         priv->buffer = LorieBuffer_wrapAHardwareBuffer(buffer);
         buffer = NULL;
         check(!priv->buffer, "DRI3: LorieBuffer_wrapAHardwareBuffer failed.");
@@ -1311,9 +1428,11 @@ static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *
         priv->gpuOnly = LorieBuffer_lock(priv->buffer, &probe) != 0;
         LorieBuffer_unlock(priv->buffer);
 
+        /* The AHB may contain physical padding hidden from the X pixmap. */
         screen->ModifyPixmapHeader(pixmap, width, height, 0, 0, desc.stride * 4, NULL);
         if (lorieServerDebugEnabled)
-            log(INFO, "DRI3: imported AHardwareBuffer, modifier %llu, %ux%u stride %u%s", (unsigned long long) modifier, desc.width, desc.height, desc.stride, priv->gpuOnly ? ", not lockable" : "");
+            log(INFO, "DRI3: imported AHardwareBuffer, modifier %llu, logical %ux%u physical %ux%u stride %u%s",
+                (unsigned long long) modifier, width, height, desc.width, desc.height, desc.stride, priv->gpuOnly ? ", not lockable" : "");
     }
 
     return pixmap;
@@ -1327,10 +1446,111 @@ static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *
     return NULL;
 }
 
+// DRI3 fds_from_pixmap: hands back a plain dma-buf fd for any GPU-sampleable pixmap, which is
+// what every regular DRI3 consumer (Vulkan, unpatched mesa) expects. AHardwareBuffer doesn't
+// expose its underlying dma-buf through public NDK API, so it's extracted the same way
+// renderer.cpp already probes for dma-buf backing: hand the whole AHardwareBuffer to ourselves
+// over a socketpair and pick out whichever received fd actually is a dma-buf.
+static int lorieFdsFromPixmap(__unused ScreenPtr screen, PixmapPtr pixmap, int *fds, uint32_t *strides, uint32_t *offsets, uint64_t *modifier) {
+    LoriePixmapPriv *priv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap);
+    if (priv && priv->locked && !priv->mem && priv->lockDepth == 0) {
+        LorieBuffer_unlock(priv->buffer);
+        priv->locked = NULL;
+        pixmap->devPrivate.ptr = NULL;
+    }
+
+    LorieBuffer *buffer = lorieEnsureGpuSampleable(pixmap, LORIEBUFFER_AHARDWAREBUFFER);
+    const LorieBuffer_Desc *desc;
+    int sv[2] = { -1, -1 }, fd = -1;
+    struct cmsghdr *cmsg;
+
+    if (!buffer)
+        return 0;
+    desc = LorieBuffer_description(buffer);
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
+        return 0;
+
+    LorieBuffer_sendRawAHardwareBufferHandleToUnixSocket(desc->buffer, sv[0]);
+    shutdown(sv[0], SHUT_WR);
+
+    // Reads every fd handed over in ancillary data until EOF, keeping the first one that turns
+    // out to be backed by a dma-buf (identified through its /proc/self/fd/N symlink target, the
+    // same trick renderer.cpp uses for detecting dma-buf-backed AHardwareBuffers); the rest are
+    // just other planes/vendor metadata of the same native handle and get closed.
+    for (;;) {
+        uint8_t data[4096];
+        union { uint8_t buf[CMSG_SPACE(32 * sizeof(int))]; struct cmsghdr align; } control;
+        struct iovec iov = { .iov_base = data, .iov_len = sizeof(data) };
+        struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = control.buf, .msg_controllen = sizeof(control.buf) };
+        ssize_t n = recvmsg(sv[1], &msg, 0);
+        if (n <= 0)
+            break;
+
+        for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+            int *cfds, ncfds, i;
+            if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS)
+                continue;
+
+            cfds = (int *) CMSG_DATA(cmsg);
+            ncfds = (int) ((cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+            for (i = 0; i < ncfds; i++) {
+                char path[32], target[256];
+                ssize_t len;
+                if (fd >= 0) {
+                    close(cfds[i]);
+                    continue;
+                }
+
+                snprintf(path, sizeof(path), "/proc/self/fd/%d", cfds[i]);
+                len = readlink(path, target, sizeof(target) - 1);
+                if (len > 0) {
+                    target[len] = '\0';
+                    if (strstr(target, "dmabuf") || strstr(target, "dma_heap") || strstr(target, "/dev/dma")) {
+                        fd = cfds[i];
+                        continue;
+                    }
+                }
+                close(cfds[i]);
+            }
+        }
+    }
+    close(sv[0]);
+    close(sv[1]);
+
+    if (fd < 0)
+        return 0;
+
+    fds[0] = fd;
+    strides[0] = desc->stride * 4;
+    offsets[0] = 0;
+    *modifier = DRM_FORMAT_MOD_LINEAR;
+    return 1;
+}
+
+// Serves the Lorie-private DRI3AHardwareBufferFromPixmap request: sends the pixmap's backing
+// AHardwareBuffer itself (as opposed to fds_from_pixmap's plain dma-buf) to clients that need
+// the full handle, e.g. GLES import via eglGetNativeClientBufferANDROID.
+int lorieSendAHardwareBufferForPixmap(PixmapPtr pixmap, int socketFd) {
+    LoriePixmapPriv *priv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap);
+    if (priv && priv->locked && !priv->mem && priv->lockDepth == 0) {
+        LorieBuffer_unlock(priv->buffer);
+        priv->locked = NULL;
+        pixmap->devPrivate.ptr = NULL;
+    }
+
+    LorieBuffer *buffer = lorieEnsureGpuSampleable(pixmap, LORIEBUFFER_AHARDWAREBUFFER);
+    if (!buffer)
+        return 0;
+
+    LorieBuffer_sendRawAHardwareBufferHandleToUnixSocket(LorieBuffer_description(buffer)->buffer, socketFd);
+    return 1;
+}
+
 static int lorieGetFormats(__unused ScreenPtr screen, CARD32 *num_formats, CARD32 **formats) {
-    static CARD32 format = DRM_FORMAT_ARGB8888;
-    *num_formats = 1;
-    *formats = &format;
+    static CARD32 formats_list[] = { DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888 };
+    *num_formats = 2;
+    *formats = formats_list;
     return TRUE;
 }
 
@@ -1348,14 +1568,39 @@ static int lorieGetModifiers(__unused ScreenPtr screen, uint32_t format, uint32_
     return TRUE;
 }
 
+static int lorieDri3Open(__unused ScreenPtr screen, __unused RRProviderPtr provider, int *fd) {
+    static const char *const devices[] = {
+        "/dev/kgsl-3d0",
+        "/dev/dri/renderD128",
+        "/dev/dri/renderD129",
+        "/dev/dri/card0",
+        "/dev/mali0",
+    };
+    for (size_t i = 0; i < sizeof(devices) / sizeof(devices[0]); i++) {
+        int dev_fd = open(devices[i], O_RDWR | O_CLOEXEC);
+        if (dev_fd >= 0) {
+            *fd = dev_fd;
+            return Success;
+        }
+    }
+    return BadMatch;
+}
+
 static dri3_screen_info_rec lorieDri3Info = {
         .version = 2,
-        .fds_from_pixmap = FalseNoop,
+        .open = lorieDri3Open,
+        .fds_from_pixmap = lorieFdsFromPixmap,
         .pixmap_from_fds = loriePixmapFromFds,
         .get_formats = lorieGetFormats,
         .get_modifiers = lorieGetModifiers,
         .get_drawable_modifiers = FalseNoop
 };
+
+static int lorieGlxSwapInterval(unused __GLXdrawable *drawable, int interval) {
+    if (interval < 0)
+        return BadValue;
+    return Success;
+}
 
 static GLboolean drawableSwapBuffers(unused ClientPtr client, unused __GLXdrawable * drawable) { return TRUE; }
 static void drawableCopySubBuffer(unused __GLXdrawable * basePrivate, unused int x, unused int y, unused int w, unused int h) {}
@@ -1393,6 +1638,7 @@ static __GLXscreen *glXDRIscreenProbe(ScreenPtr pScreen) {
 
     screen->destroy = glXDRIscreenDestroy;
     screen->createDrawable = createDrawable;
+    screen->swapInterval = lorieGlxSwapInterval;
     screen->pScreen = pScreen;
     screen->fbconfigs = configs;
     screen->glvnd = "mesa";
@@ -1410,7 +1656,18 @@ static __GLXscreen *glXDRIscreenProbe(ScreenPtr pScreen) {
     __glXEnableExtension(screen->glx_enable_bits, "GLX_ARB_fbconfig_float");
     __glXEnableExtension(screen->glx_enable_bits, "GLX_EXT_fbconfig_packed_float");
     __glXEnableExtension(screen->glx_enable_bits, "GLX_EXT_texture_from_pixmap");
+    __glXEnableExtension(screen->glx_enable_bits, "GLX_SGI_swap_control");
+    __glXEnableExtension(screen->glx_enable_bits, "GLX_EXT_swap_control");
+    __glXEnableExtension(screen->glx_enable_bits, "GLX_MESA_swap_control");
     __glXScreenInit(screen, pScreen);
+
+    if (screen->GLXextensions) {
+        char *exts = NULL;
+        if (asprintf(&exts, "%s GLX_EXT_swap_control GLX_MESA_swap_control", screen->GLXextensions) != -1) {
+            free(screen->GLXextensions);
+            screen->GLXextensions = exts;
+        }
+    }
 
     return screen;
 }

@@ -25,25 +25,45 @@
 #include <dlfcn.h>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/inotify.h>
 #include <sys/syscall.h>
 #include <linux/futex.h>
 #include <unistd.h>
 #include "list.h"
 #include "lorie.h"
+#include "builtin_shaders.h"
 
 // libEGL exports this only since API 26, weak so the library still loads below that.
 __attribute__((weak)) EGLClientBuffer eglGetNativeClientBufferANDROID(const struct AHardwareBuffer* buffer);
 
-#define log(...) __android_log_print(ANDROID_LOG_DEBUG, "gles-renderer", __VA_ARGS__)
+#define log(...) __android_log_print(ANDROID_LOG_INFO, "gles-renderer", __VA_ARGS__)
 #define loge(...) __android_log_print(ANDROID_LOG_ERROR, "gles-renderer", __VA_ARGS__)
 
-static constexpr EGLTimeKHR FENCE_TIMEOUT_NANOS = 100000000;
-
-static void waitForFence(EGLDisplay egl_display, EGLSync fence, EGLint flags) {
-    if (eglClientWaitSyncKHR(egl_display, fence, flags, FENCE_TIMEOUT_NANOS) == EGL_TIMEOUT_EXPIRED_KHR)
-        loge("GPU fence wasn't signalled within %lldns, proceeding without it", (long long) FENCE_TIMEOUT_NANOS);
+// Waits for a GPU fence, bounded to (roughly) one vsync period instead of EGL_FOREVER: some
+// GPU drivers lose a fence's signal across a power state transition, wedging the caller forever.
+static void waitForFence(EGLDisplay egl_display, EGLSync fence, lorie_shared_server_state* state) {
+    const int64_t defaultIntervalNanos = 1000000000LL / 30; // no vsync tick observed yet
+    int64_t interval = (state && state->vsyncIntervalNanos > 0) ? state->vsyncIntervalNanos : defaultIntervalNanos;
+    int64_t budget = interval;
+    if (state && state->vsyncIntervalNanos > 0) {
+        struct timespec now{};
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int64_t nowNanos = (int64_t) now.tv_sec * 1000000000LL + now.tv_nsec;
+        int64_t nextVsync = state->lastVsyncNanos + interval;
+        while (nextVsync <= nowNanos)
+            nextVsync += interval;
+        budget = nextVsync - nowNanos;
+    }
+    budget -= budget / 10;
+    EGLTimeKHR timeout = (EGLTimeKHR) (budget > 0 ? budget : 0);
+    if (eglClientWaitSyncKHR(egl_display, fence, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, timeout) == EGL_TIMEOUT_EXPIRED_KHR)
+        loge("Xlorie: GPU fence wasn't signalled within %lldns, proceeding without it\n", (long long) timeout);
     eglDestroySyncKHR(egl_display, fence);
 }
 
@@ -350,6 +370,11 @@ void Renderer::destroy() {
 
     pthread_join(thread, nullptr);
     thread = 0;
+    if (shaderInotifyFd >= 0) {
+        close(shaderInotifyFd);
+        shaderInotifyFd = -1;
+        shaderInotifyWd = -1;
+    }
     ctx = EGL_NO_CONTEXT; // re-passes init()'s `if (ctx) return;` guard for a future re-init
 }
 
@@ -359,6 +384,27 @@ int Renderer::getWakeupCondFd() const {
 
 void Renderer::setFiltering(jint f) {
     filtering = f;
+}
+
+void Renderer::setCustomScaler(const char* name) {
+    const char* target = (name && name[0]) ? name : "off";
+    loge("Xlorie: setCustomScaler requested: %s\n", target);
+    pthread_mutex_lock(&stateLock);
+    if (strncmp(requestedScaler, target, sizeof(requestedScaler)) != 0) {
+        strncpy(requestedScaler, target, sizeof(requestedScaler) - 1);
+        requestedScaler[sizeof(requestedScaler) - 1] = '\0';
+        scalerChanged = true;
+    }
+    if (state)
+        state->drawRequested = true;
+    pthread_cond_signal(stateCond);
+    pthread_mutex_unlock(&stateLock);
+}
+
+void Renderer::setSwapInterval(int interval) {
+    swapInterval = interval;
+    if (sfc && sfc != defaultSfc)
+        eglSwapInterval(egl_display, swapInterval);
 }
 
 // Mimics what the X server and the renderer do to the root buffer: the server holds a CPU lock
@@ -377,6 +423,7 @@ static bool cpuAndGpuShareAhbMemory(EGLDisplay egl_display) {
     EGLImageKHR image = EGL_NO_IMAGE_KHR;
     GLuint texture = 0, fbo = 0;
     volatile uint32_t *pixels = nullptr;
+    uint32_t gpuPixel = 0;
     bool result = true;
 
     if (AHardwareBuffer_allocate(&desc, &buf) != 0 || !buf)
@@ -401,21 +448,27 @@ static bool cpuAndGpuShareAhbMemory(EGLDisplay egl_display) {
                              -1, nullptr, (void **) &pixels) != 0 || !pixels)
         goto out;
     pixels[0] = 0;
+    AHardwareBuffer_unlock(buf, nullptr);
+    pixels = nullptr;
 
-    // GPU writes while the buffer is locked by the CPU.
+    // GPU writes while the buffer is not locked by the CPU.
     glClearColor(0x11 / 255.f, 0x22 / 255.f, 0x33 / 255.f, 1.f);
     glClear(GL_COLOR_BUFFER_BIT);
     glFinish();
 
-    if ((pixels[0] & 0xffffff) != 0x332211) {
-        loge("CPU mapping does not see GPU writes (got %08x)", pixels[0]);
-        AHardwareBuffer_unlock(buf, nullptr);
+    if (AHardwareBuffer_lock(buf, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
+                             -1, nullptr, (void **) &pixels) != 0 || !pixels)
+        goto out;
+    gpuPixel = pixels[0];
+    AHardwareBuffer_unlock(buf, nullptr);
+    pixels = nullptr;
+
+    if ((gpuPixel & 0xffffff) != 0x332211) {
+        loge("CPU mapping does not see GPU writes (got %08x)", gpuPixel);
         result = false;
         goto out;
     }
 
-    // Unlocking must not bring back stale CPU data over what the GPU has written.
-    AHardwareBuffer_unlock(buf, nullptr);
     {
         uint8_t px[4] = {0, 0, 0, 0};
         glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
@@ -426,6 +479,8 @@ static bool cpuAndGpuShareAhbMemory(EGLDisplay egl_display) {
     }
 
 out:
+    if (pixels)
+        AHardwareBuffer_unlock(buf, nullptr);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     if (fbo)
         glDeleteFramebuffers(1, &fbo);
@@ -651,6 +706,9 @@ void Renderer::setWindow(JNIEnv *env, jobject jsfc) {
 
 void Renderer::releaseWinAndSurface(ANativeWindow** anw, EGLSurface *esfc) {
     if (esfc && *esfc && *esfc != defaultSfc) {
+        // Ensure non-blocking swap before destruction to prevent UI thread hangs
+        eglSwapInterval(egl_display, 0);
+        appliedSwapInterval = 0;
         // Requeue the dequeued buffer, causes flickering during window reconfiguring
         eglSwapBuffers(egl_display, *esfc);
         if (eglMakeCurrent(egl_display, defaultSfc, defaultSfc, ctx) != EGL_TRUE)
@@ -742,7 +800,8 @@ void Renderer::refreshContext() {
         return vprintEglError("eglMakeCurrent failed", __LINE__);
     }
 
-    eglSwapInterval(egl_display, 0);
+    eglSwapInterval(egl_display, sfc != defaultSfc ? swapInterval : 0);
+    appliedSwapInterval = sfc != defaultSfc ? swapInterval : 0;
 
     // We should redraw image at least once right after surface change
     if (state)
@@ -898,7 +957,7 @@ void Renderer::applyPendingGpuCopies() {
     if (serial) {
         EGLSync fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, nullptr);
         glFlush();
-        waitForFence(egl_display, fence, 0);
+        waitForFence(egl_display, fence, state);
         // Only now that the GPU has actually finished (not just been told to start) is it safe to
         // let present_execute_copy release/idle the source pixmap back to the client.
         __atomic_store_n(&state->gpuCopyQueue.completedSerial, serial, __ATOMIC_RELEASE);
@@ -945,11 +1004,13 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
     desc = LorieBuffer_description(buffer);
 
     int alignedExpectedW = expectedW - (expectedW % CVT_H_GRANULARITY);
+    int alignedExpectedH = (expectedH + 3) & ~3;
 
-    if (!expectedW || !expectedH || desc->height != expectedH ||
+    if (!expectedW || !expectedH ||
+        (desc->height != expectedH && desc->height != alignedExpectedH) ||
         (desc->width != alignedExpectedW && desc->width != expectedW)) {
-        log("Buffer %llu is not of expected size, expecting %dx%d or %dx%d, got %dx%d",
-            state->rootWindowTextureID, alignedExpectedW, expectedH, expectedW, expectedH,
+        log("Buffer %llu is not of expected size, expecting %dx(%d|%d) or %dx(%d|%d), got %dx%d",
+            state->rootWindowTextureID, alignedExpectedW, expectedH, alignedExpectedH, expectedW, expectedH, alignedExpectedH,
             desc->width, desc->height);
         // Otherwise rendererShouldWait sees drawRequested or a pending cursor update and busy-spins
         // retrying this same mismatch instead of waiting for the buffer of the requested size.
@@ -981,7 +1042,8 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
         renderViewportY = (int) lroundf(centerY - (float) renderViewportH / 2.f);
     }
 
-    auto sourceWidth = (float) desc->width, sourceHeight = (float) desc->height;
+    auto sourceWidth = fminf((float) desc->width, (float) expectedW);
+    auto sourceHeight = fminf((float) desc->height, (float) expectedH);
     auto logicalSourceWidth = (float) expectedW, logicalSourceHeight = (float) expectedH;
     if (zoomPercent > 100) {
         float requestedScale = (float) zoomPercent / 100.f;
@@ -1049,6 +1111,13 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
     uint64_t gpuCopySerial = applyPendingGpuCopiesLocked();
     state->drawRequested = FALSE;
 
+    checkCustomShader();
+
+    float rSrcW = (desc->type == LORIEBUFFER_FD) ? (float) desc->stride : (float) desc->width;
+    float rSrcH = (float) desc->height;
+    float rDstW = (float) renderViewportW;
+    float rDstH = (float) renderViewportH;
+
     LorieBuffer_bindTexture(buffer);
     if (desc->type == LORIEBUFFER_FD)
         xfactor = (float) desc->width/(float) desc->stride;
@@ -1056,7 +1125,8 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
                sourceLeft / (float) desc->width * xfactor, sourceTop / (float) desc->height,
                (sourceLeft + sourceWidth) / (float) desc->width * xfactor,
                (sourceTop + sourceHeight) / (float) desc->height,
-               LorieBuffer_isRgba(buffer));
+               LorieBuffer_isRgba(buffer),
+               rSrcW, rSrcH, rDstW, rDstH);
     fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, nullptr);
     glFlush();
 
@@ -1074,7 +1144,7 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
     glFlush();
 
     // Wait until root window drawing is finished before giving control back to X server
-    waitForFence(egl_display, fence, 0);
+    waitForFence(egl_display, fence, state);
     if (gpuCopySerial) {
         __atomic_store_n(&state->gpuCopyQueue.completedSerial, gpuCopySerial, __ATOMIC_RELEASE);
         notifyGpuCopyDone();
@@ -1082,17 +1152,26 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
     state->waitForNextFrame = true;
     lorie_mutex_unlock(&state->lock, &state->lockingPid);
 
+    if (appliedSwapInterval != swapInterval && sfc != defaultSfc) {
+        eglSwapInterval(egl_display, swapInterval);
+        appliedSwapInterval = swapInterval;
+    }
+
     if (eglSwapBuffers(egl_display, sfc) != EGL_TRUE)
         printEglError("Failed to swap buffers", __LINE__);
 
-    // Perform a little drawing operation to make sure the next buffer is ready on the next invocation of drawing
-    glEnable(GL_SCISSOR_TEST);
-    glScissor(0, 0, 1, 1);
-    glClearColor(0, 0, 0, 0);
-    glClear(GL_COLOR_BUFFER_BIT);
-    glDisable(GL_SCISSOR_TEST);
-    fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, nullptr);
-    waitForFence(egl_display, fence, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR);
+    // Only perform pre-dequeue scissor clear when swapInterval == 0.
+    // When swapInterval >= 1, pre-dequeuing blocks until the next VSync, causing
+    // double-waiting latency and cutting refresh rate in half (e.g. 60 FPS -> 30 FPS).
+    if (swapInterval == 0) {
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(0, 0, 1, 1);
+        glClearColor(0, 0, 0, 0);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDisable(GL_SCISSOR_TEST);
+        fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, nullptr);
+        waitForFence(egl_display, fence, state);
+    }
 
     state->renderedFrames++;
 }
@@ -1209,6 +1288,9 @@ void Renderer::threadLoop() {
 
     glDeleteProgram(g_texture_program);
     glDeleteProgram(g_texture_program_bgra);
+    if (progCustom && progCustom != g_texture_program) glDeleteProgram(progCustom);
+    if (progCustomBgra && progCustomBgra != g_texture_program_bgra && progCustomBgra != progCustom)
+        glDeleteProgram(progCustomBgra);
     glDeleteTextures(1, &cursor.id);
     eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     if (sfc != defaultSfc) // defensive; setWindow(nullptr) already reverts this before onDetachedFromWindow runs
@@ -1261,6 +1343,8 @@ static GLuint createProgram(const char* p_vertex_source, const char* p_fragment_
 
     glAttachShader(program, vertexShader);
     glAttachShader(program, pixelShader);
+    glBindAttribLocation(program, 0, "position");
+    glBindAttribLocation(program, 1, "texCoords");
     glLinkProgram(program);
     glGetProgramiv(program, GL_LINK_STATUS, &linkStatus);
     if (linkStatus == GL_TRUE)
@@ -1277,7 +1361,7 @@ static GLuint createProgram(const char* p_vertex_source, const char* p_fragment_
     return 0;
 }
 
-void Renderer::drawRegion(GLuint id, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, uint8_t flip) {
+void Renderer::drawRegion(GLuint id, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, uint8_t flip, float srcW, float srcH, float dstW, float dstH) {
     float coords[16] = {
         x0, -y0, u0, v0,
         x1, -y0, u1, v0,
@@ -1285,20 +1369,215 @@ void Renderer::drawRegion(GLuint id, float x0, float y0, float x1, float y1, flo
         x1, -y1, u1, v1,
     };
 
+    bool isRootDesktop = (srcW > 0.f && srcH > 0.f);
+    GLuint prog = flip ? g_texture_program_bgra : g_texture_program;
     GLuint p = flip ? gv_pos_bgra : gv_pos, c = flip ? gv_coords_bgra : gv_coords;
+    if (customShaderLoaded && isRootDesktop && (flip ? progCustomBgra : progCustom)) {
+        prog = flip ? progCustomBgra : progCustom;
+        p = 0;
+        c = 1;
+    }
 
     glActiveTexture(GL_TEXTURE0);
-    glUseProgram(flip ? g_texture_program_bgra : g_texture_program);
+    glUseProgram(prog);
     if (id)
         glBindTexture(GL_TEXTURE_2D, id);
 
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filtering);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filtering);
+    if (customShaderLoaded && isRootDesktop) {
+        GLint locTex = glGetUniformLocation(prog, "texture");
+        if (locTex >= 0) glUniform1i(locTex, 0);
+        GLint locTs = glGetUniformLocation(prog, "u_tex_size");
+        if (locTs >= 0) glUniform2f(locTs, srcW, srcH);
+        GLint locTxs = glGetUniformLocation(prog, "u_texel_size");
+        if (locTxs >= 0) glUniform2f(locTxs, 1.0f / srcW, 1.0f / srcH);
+        GLint locDs = glGetUniformLocation(prog, "u_dst_size");
+        if (locDs >= 0) glUniform2f(locDs, dstW > 0.f ? dstW : srcW, dstH > 0.f ? dstH : srcH);
+        GLint locSharp = glGetUniformLocation(prog, "u_sharpness");
+        if (locSharp >= 0) glUniform1f(locSharp, 0.8f);
+
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    } else {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filtering);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filtering);
+    }
+
     glVertexAttribPointer(p, 2, GL_FLOAT, GL_FALSE, 16, coords);
     glVertexAttribPointer(c, 2, GL_FLOAT, GL_FALSE, 16, &coords[2]);
     glEnableVertexAttribArray(p);
     glEnableVertexAttribArray(c);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4); checkGlError();
+}
+
+static GLuint compileScalerVariant(const char* vertexSrc, const char* fragmentSrc, bool swizzleBgra) {
+    if (!swizzleBgra) {
+        return createProgram(vertexSrc, fragmentSrc);
+    }
+    size_t len = strlen(fragmentSrc);
+    char* bgraSrc = (char*) malloc(len + 128);
+    if (!bgraSrc) return 0;
+    snprintf(bgraSrc, len + 128, "#define BGRA_INPUT 1\n#define SWIZZLE .bgra\n%s", fragmentSrc);
+    GLuint prog = createProgram(vertexSrc, bgraSrc);
+    free(bgraSrc);
+    return prog;
+}
+
+void Renderer::applyScalerOnRendererThread() {
+    char target[32];
+    pthread_mutex_lock(&stateLock);
+    strncpy(target, requestedScaler, sizeof(target) - 1);
+    target[sizeof(target) - 1] = '\0';
+    scalerChanged = false;
+    pthread_mutex_unlock(&stateLock);
+
+    loge("Xlorie: Applying scaler on render thread: %s (current: %s)\n", target, currentScaler);
+
+    if (strcmp(target, "off") == 0) {
+        if (customShaderLoaded) {
+            loge("Xlorie: Scaler disabled, reverting to default GLES pipeline\n");
+            if (progCustom && progCustom != g_texture_program) glDeleteProgram(progCustom);
+            if (progCustomBgra && progCustomBgra != g_texture_program_bgra && progCustomBgra != progCustom)
+                glDeleteProgram(progCustomBgra);
+            progCustom = 0;
+            progCustomBgra = 0;
+            customShaderLoaded = false;
+            customShaderMtime = 0;
+        }
+        strncpy(currentScaler, "off", sizeof(currentScaler));
+        return;
+    }
+
+    const char* src = nullptr;
+    if (strcmp(target, "fsr") == 0) {
+        src = BUILTIN_SHADER_FSR;
+    } else if (strcmp(target, "bicas") == 0) {
+        src = BUILTIN_SHADER_BICAS;
+    } else if (strcmp(target, "sgsr") == 0) {
+        src = BUILTIN_SHADER_SGSR;
+    } else if (strcmp(target, "nis") == 0) {
+        src = BUILTIN_SHADER_NIS;
+    } else if (strcmp(target, "rcas") == 0) {
+        src = BUILTIN_SHADER_RCAS;
+    } else if (strcmp(target, "lanczos") == 0) {
+        src = BUILTIN_SHADER_LANCZOS;
+    }
+
+    if (src) {
+        GLuint pRgba = compileScalerVariant(vertexShaderSrc, src, false);
+        GLuint pBgra = compileScalerVariant(vertexShaderSrc, src, true);
+        if (pRgba && pBgra) {
+            if (progCustom && progCustom != g_texture_program) glDeleteProgram(progCustom);
+            if (progCustomBgra && progCustomBgra != g_texture_program_bgra && progCustomBgra != progCustom)
+                glDeleteProgram(progCustomBgra);
+            progCustom = pRgba;
+            progCustomBgra = pBgra;
+            customShaderLoaded = true;
+            strncpy(currentScaler, target, sizeof(currentScaler));
+            loge("Xlorie: Successfully activated built-in scaler: %s (RGBA prog %u, BGRA prog %u)\n",
+                 target, pRgba, pBgra);
+        } else {
+            loge("Xlorie: Failed to compile built-in scaler: %s\n", target);
+            if (pRgba) glDeleteProgram(pRgba);
+            if (pBgra) glDeleteProgram(pBgra);
+        }
+        return;
+    }
+
+    // Otherwise, check custom external shader file
+    checkCustomShaderFile();
+}
+
+void Renderer::checkCustomShaderFile() {
+    static const char* const customShaderPaths[] = {
+        "/sdcard/Download/termux_upscaler.glsl",
+        "/sdcard/termux_upscaler.glsl",
+        "/data/data/com.termux/files/home/shaders/active.glsl",
+        "/data/data/com.termux/files/home/shaders/current.glsl",
+        "/data/data/com.termux/files/home/shaders/upscaler.glsl",
+        "/data/data/com.termux/files/home/shaders/upscaler.frag",
+        "/data/data/com.termux/files/home/.config/termux-x11/shaders/upscaler.frag",
+        "/data/data/com.termux/files/home/.config/termux-x11/upscaler.glsl",
+        "/sdcard/termux-x11/shaders/upscaler.frag"
+    };
+
+    const char* foundPath = nullptr;
+    struct stat st{};
+    for (size_t i = 0; i < sizeof(customShaderPaths) / sizeof(customShaderPaths[0]); i++) {
+        if (stat(customShaderPaths[i], &st) == 0 && S_ISREG(st.st_mode)) {
+            foundPath = customShaderPaths[i];
+            break;
+        }
+    }
+
+    if (!foundPath) {
+        if (customShaderLoaded) {
+            loge("Xlorie: Custom shader file removed, reverting to standard pipeline\n");
+            if (progCustom && progCustom != g_texture_program) glDeleteProgram(progCustom);
+            if (progCustomBgra && progCustomBgra != g_texture_program_bgra && progCustomBgra != progCustom)
+                glDeleteProgram(progCustomBgra);
+            progCustom = 0;
+            progCustomBgra = 0;
+            customShaderLoaded = false;
+            customShaderMtime = 0;
+            strncpy(currentScaler, "off", sizeof(currentScaler));
+        }
+        return;
+    }
+
+    if (customShaderLoaded && st.st_mtime == customShaderMtime)
+        return;
+
+    FILE* f = fopen(foundPath, "rb");
+    if (!f) {
+        loge("Xlorie: Failed to open custom shader file %s (errno %d)\n", foundPath, errno);
+        return;
+    }
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (len <= 0 || len > 256 * 1024) { fclose(f); return; }
+
+    char* src = (char*) malloc(len + 1);
+    if (!src) { fclose(f); return; }
+    fread(src, 1, len, f);
+    src[len] = '\0';
+    fclose(f);
+
+    GLuint newProg = compileScalerVariant(vertexShaderSrc, src, false);
+    GLuint newProgBgra = compileScalerVariant(vertexShaderSrc, src, true);
+    free(src);
+
+    if (!newProg || !newProgBgra) {
+        loge("Xlorie: Failed to compile custom shader file from %s\n", foundPath);
+        if (newProg) glDeleteProgram(newProg);
+        if (newProgBgra) glDeleteProgram(newProgBgra);
+        return;
+    }
+
+    if (progCustom && progCustom != g_texture_program) glDeleteProgram(progCustom);
+    if (progCustomBgra && progCustomBgra != g_texture_program_bgra && progCustomBgra != progCustom)
+        glDeleteProgram(progCustomBgra);
+
+    progCustom = newProg;
+    progCustomBgra = newProgBgra;
+    customShaderLoaded = true;
+    customShaderMtime = st.st_mtime;
+    strncpy(currentScaler, "custom", sizeof(currentScaler));
+    loge("Xlorie: Loaded and compiled custom shader from %s (mtime %ld, RGBA %u, BGRA %u)\n",
+         foundPath, (long) customShaderMtime, progCustom, progCustomBgra);
+}
+
+void Renderer::checkCustomShader() {
+    if (scalerChanged || strcmp(requestedScaler, currentScaler) != 0) {
+        applyScalerOnRendererThread();
+        return;
+    }
+
+    if (strcmp(currentScaler, "custom") == 0) {
+        if ((customShaderCheckCounter++ & 63) == 0) {
+            checkCustomShaderFile();
+        }
+    }
 }
 
 void Renderer::drawCursor(float displayWidth, float displayHeight, float sourceLeft, float sourceTop, float cursorX, float cursorY) {

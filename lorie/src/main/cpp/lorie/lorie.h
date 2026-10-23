@@ -252,6 +252,9 @@ struct lorie_shared_server_state {
     /* Needed to show FPS counter in logcat */
     volatile int renderedFrames;
 
+    volatile int64_t lastVsyncNanos; // Last vsync, CLOCK_MONOTONIC nanoseconds.
+    volatile int64_t vsyncIntervalNanos; // Frame period, nanoseconds. Bounds waitForFence().
+
     struct {
         // We should not allow updating cursor content the same time renderer draws it.
         // locking the mutex protecting the root window can cause waiting for the frame to be drawn which is unacceptable
@@ -280,7 +283,18 @@ struct Renderer {
     EGLConfig cfg = nullptr;
     ANativeWindow *defaultWin = nullptr, *win = nullptr;
     struct xorg_list addedBuffers{}, buffers{}, removedBuffers{};
-    volatile jint filtering = GL_NEAREST;
+    volatile jint filtering = GL_LINEAR;
+    volatile jint swapInterval = 1;
+    int appliedSwapInterval = -1;
+
+    GLuint progCustom = 0, progCustomBgra = 0;
+    time_t customShaderMtime = 0;
+    bool customShaderLoaded = false;
+    uint32_t customShaderCheckCounter = 0;
+    int shaderInotifyFd = -1, shaderInotifyWd = -1;
+    char requestedScaler[32] = "off";
+    char currentScaler[32] = "off";
+    volatile bool scalerChanged = false;
 
     pthread_t thread = 0;
     volatile bool stopping = false;
@@ -347,6 +361,11 @@ struct Renderer {
     void* initThread();
     int getWakeupCondFd() const;
     void setFiltering(jint f);
+    void setCustomScaler(const char* name);
+    void setSwapInterval(int interval);
+    void checkCustomShader();
+    void applyScalerOnRendererThread();
+    void checkCustomShaderFile();
     void testCapabilities(int* legacy_drawing, int* gpu_present_disabled);
     void setSharedState(struct lorie_shared_server_state* newState);
     void addBuffer(LorieBuffer* buf);
@@ -369,7 +388,7 @@ struct Renderer {
     void bindTexture(GLuint id) const;
     void notifyGpuCopyDone() const;
     void reportViewport(int dstX, int dstY, int dstW, int dstH, float left, float top, float width, float height);
-    void drawRegion(GLuint id, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, uint8_t flip);
+    void drawRegion(GLuint id, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, uint8_t flip, float srcW = 0.f, float srcH = 0.f, float dstW = 0.f, float dstH = 0.f);
     void drawCursor(float displayWidth, float displayHeight, float sourceLeft, float sourceTop, float cursorX, float cursorY);
 };
 #endif
