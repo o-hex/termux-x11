@@ -999,7 +999,7 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     if (dstDesc->type == LORIEBUFFER_AHARDWAREBUFFER && dstPriv && dstPriv->locked) {
         if (LorieBuffer_unlock(dstPriv->buffer) != 0) {
             gpuCopyAttempts++;
-            gpuCopyDisabled++;
+            gpuCopyFallbackOther++;
             return FALSE;
         }
         dstPriv->locked = NULL;
