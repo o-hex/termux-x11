@@ -22,6 +22,7 @@ import android.hardware.input.InputManager;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.Build;
+import android.os.SystemClock;
 import android.util.DisplayMetrics;
 import android.view.Display;
 import android.view.GestureDetector;
