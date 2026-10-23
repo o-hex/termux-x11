@@ -94,6 +94,8 @@ public class TouchInputHandler {
     private final HardwareMouseListener mHMListener = new HardwareMouseListener();
     private final DexListener mDexListener;
     private final TouchInputHandler mTouchpadHandler;
+    private final PalmRejectionFilter mPalmFilter = new PalmRejectionFilter();
+    private boolean mFingerIsDown = false;
 
     /** Used to disambiguate a 2-finger gesture as a swipe or a pinch. */
     private final SwipeDetector mSwipePinchDetector;
@@ -217,6 +219,7 @@ public class TouchInputHandler {
         // that intentional swipes are usually detected.
         float density = /*desktop*/ activity.getResources().getDisplayMetrics().density;
         mSwipeThreshold = 40 * density;
+        mPalmFilter.setPalmTouchMajorThreshold(Math.max(80f, 45f * density));
 
 //        mEdgeSlopInPx = ViewConfiguration.get(/*desktop*/ ctx).getScaledEdgeSlop();
 
@@ -329,25 +332,120 @@ public class TouchInputHandler {
             event.offsetLocation(-offsetX, -offsetY);
         }
 
-        if (!view.isFocused() && event.getAction() == MotionEvent.ACTION_DOWN)
+        if (!view.isFocused() && event.getActionMasked() == MotionEvent.ACTION_DOWN)
             view.requestFocus();
 
-        if (event.getAction() == MotionEvent.ACTION_UP)
+        if (event.getActionMasked() == MotionEvent.ACTION_UP)
             setCapturingEnabled(true);
 
-        if (event.getToolType(event.getActionIndex()) == MotionEvent.TOOL_TYPE_STYLUS
-                || event.getToolType(event.getActionIndex()) == MotionEvent.TOOL_TYPE_ERASER)
-            return mStylusListener.onTouch(event);
+        int pointerCount = event.getPointerCount();
+        int stylusPointerIndex = -1;
+        int fingerPointerIndex = -1;
 
+        for (int i = 0; i < pointerCount; i++) {
+            int tool = event.getToolType(i);
+            if (tool == MotionEvent.TOOL_TYPE_STYLUS || tool == MotionEvent.TOOL_TYPE_ERASER) {
+                if (stylusPointerIndex == -1)
+                    stylusPointerIndex = i;
+            } else if (tool == MotionEvent.TOOL_TYPE_FINGER) {
+                if (fingerPointerIndex == -1)
+                    fingerPointerIndex = i;
+            }
+        }
+
+        long nowMs = SystemClock.uptimeMillis();
+        int actionMasked = event.getActionMasked();
+
+        // 1. Process Stylus Pointer if present
+        if (stylusPointerIndex != -1) {
+            boolean isDown = (actionMasked != MotionEvent.ACTION_UP &&
+                              actionMasked != MotionEvent.ACTION_CANCEL &&
+                              actionMasked != MotionEvent.ACTION_HOVER_EXIT);
+            if (actionMasked == MotionEvent.ACTION_POINTER_UP && event.getActionIndex() == stylusPointerIndex)
+                isDown = false;
+
+            mPalmFilter.notifyStylusEvent(nowMs, isDown);
+
+            if (mPalmFilter.checkAndClearNeedFingerCancel() || mFingerIsDown)
+                dispatchCancelFinger(view);
+
+            return mStylusListener.onTouch(event, stylusPointerIndex);
+        }
+
+        // 2. Hardware Mouse / DeX Events
         if (!isDexEvent(event) && (event.getToolType(event.getActionIndex()) == MotionEvent.TOOL_TYPE_MOUSE
                 || (event.getSource() & InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE)
                 || (event.getSource() & InputDevice.SOURCE_MOUSE_RELATIVE) == InputDevice.SOURCE_MOUSE_RELATIVE)
             return mHMListener.onTouch(view, event);
 
-        if (event.getToolType(event.getActionIndex()) == MotionEvent.TOOL_TYPE_FINGER) {
+        // 3. Touch / Finger Events with Palm Rejection
+        if (event.getToolType(event.getActionIndex()) == MotionEvent.TOOL_TYPE_FINGER || fingerPointerIndex != -1) {
             // Dex touchpad (in non-captured mode) sends events as finger, but it should be considered as a mouse.
             if (isDexEvent(event) && mDexListener.onTouch(view, event))
                 return true;
+
+            int activeIndex = (actionMasked == MotionEvent.ACTION_POINTER_DOWN || actionMasked == MotionEvent.ACTION_POINTER_UP)
+                    ? event.getActionIndex()
+                    : (fingerPointerIndex != -1 ? fingerPointerIndex : 0);
+
+            float viewWidth = view.getWidth();
+            float viewHeight = view.getHeight();
+
+            switch (actionMasked) {
+                case MotionEvent.ACTION_DOWN:
+                    if (mPalmFilter.shouldReject(event, 0, viewWidth, viewHeight)) {
+                        mFingerIsDown = false;
+                        return true;
+                    }
+                    mFingerIsDown = true;
+                    mPalmFilter.notifyFingerTouch(true);
+                    mSuppressCursorMovement = false;
+                    mSwipeCompleted = false;
+                    mIsDragging = false;
+                    break;
+
+                case MotionEvent.ACTION_POINTER_DOWN:
+                    if (!mFingerIsDown)
+                        return true;
+                    if (mPalmFilter.shouldReject(event, activeIndex, viewWidth, viewHeight))
+                        return true;
+                    mTotalMotionY = 0;
+                    break;
+
+                case MotionEvent.ACTION_MOVE:
+                    if (!mFingerIsDown)
+                        return true;
+                    if (mPalmFilter.shouldReject(event, activeIndex, viewWidth, viewHeight)) {
+                        dispatchCancelFinger(view);
+                        return true;
+                    }
+                    break;
+
+                case MotionEvent.ACTION_UP:
+                    if (!mFingerIsDown) {
+                        mPalmFilter.notifyFingerTouch(false);
+                        return true;
+                    }
+                    mFingerIsDown = false;
+                    mPalmFilter.notifyFingerTouch(false);
+                    break;
+
+                case MotionEvent.ACTION_CANCEL:
+                    mFingerIsDown = false;
+                    mPalmFilter.notifyFingerTouch(false);
+                    break;
+
+                case MotionEvent.ACTION_SCROLL:
+                    float scrollY = -100 * event.getAxisValue(MotionEvent.AXIS_VSCROLL);
+                    float scrollX = -100 * event.getAxisValue(MotionEvent.AXIS_HSCROLL);
+                    mInjector.sendMouseWheelEvent(scrollX, scrollY);
+                    return true;
+
+                default:
+                    if (!mFingerIsDown && mPalmFilter.getMode() != PalmRejectionFilter.MODE_DISABLED)
+                        return true;
+                    break;
+            }
 
             // Give the underlying input strategy a chance to observe the current motion event before
             // passing it to the gesture detectors.  This allows the input strategy to react to the
@@ -375,31 +473,39 @@ public class TouchInputHandler {
                         mInjector.sendMouseEvent(null, button[1], mouseButtonDown(button[0]), true);
                 savedBS = currentBS;
             }
-            switch (event.getActionMasked()) {
-                case MotionEvent.ACTION_DOWN:
-                    mSuppressCursorMovement = false;
-                    mSwipeCompleted = false;
-                    mIsDragging = false;
-                    break;
 
-                case MotionEvent.ACTION_SCROLL:
-                    float scrollY = -100 * event.getAxisValue(MotionEvent.AXIS_VSCROLL);
-                    float scrollX = -100 * event.getAxisValue(MotionEvent.AXIS_HSCROLL);
-
-                    mInjector.sendMouseWheelEvent(scrollX, scrollY);
-                    return true;
-
-                case MotionEvent.ACTION_POINTER_DOWN:
-                    mTotalMotionY = 0;
-                    break;
-
-                default:
-                    break;
-            }
             return true;
         }
 
         return false;
+    }
+
+    public PalmRejectionFilter getPalmFilter() {
+        return mPalmFilter;
+    }
+
+    private void dispatchCancelFinger(View view) {
+        if (!mFingerIsDown)
+            return;
+
+        mFingerIsDown = false;
+        mPalmFilter.notifyFingerTouch(false);
+        long now = SystemClock.uptimeMillis();
+        MotionEvent cancelEvent = MotionEvent.obtain(now, now, MotionEvent.ACTION_CANCEL, 0, 0, 0);
+        try {
+            if (mInputStrategy instanceof InputStrategyInterface.NullInputStrategy)
+                mInjector.sendTouchEvent(cancelEvent, mRenderData);
+            else
+                mInputStrategy.onMotionEvent(cancelEvent);
+
+            mScroller.onTouchEvent(cancelEvent);
+            if (!(mInputStrategy instanceof InputStrategyInterface.NullInputStrategy))
+                mZoomer.onTouchEvent(cancelEvent);
+            mTapDetector.onTouchEvent(cancelEvent);
+            mSwipePinchDetector.onTouchEvent(cancelEvent);
+        } finally {
+            cancelEvent.recycle();
+        }
     }
 
     public void handleInputTransformChanged(int screenWidth, int screenHeight, Matrix inputTransform) {
@@ -504,6 +610,21 @@ public class TouchInputHandler {
         mediaKeysAction = extractUserActionFromPreferences(p, "mediaKeys");
 
         ignoreGamepadEvents = p.ignoreGamepadEvents.get();
+
+        if (p.enablePalmRejection != null && p.palmRejectionMode != null) {
+            if (!p.enablePalmRejection.get()) {
+                mPalmFilter.setMode(PalmRejectionFilter.MODE_DISABLED);
+            } else {
+                String mode = p.palmRejectionMode.get();
+                if ("pen_only".equals(mode)) {
+                    mPalmFilter.setMode(PalmRejectionFilter.MODE_PEN_ONLY);
+                } else if ("stylus_priority".equals(mode)) {
+                    mPalmFilter.setMode(PalmRejectionFilter.MODE_STYLUS_PRIORITY);
+                } else {
+                    mPalmFilter.setMode(PalmRejectionFilter.MODE_STYLUS_AND_AREA);
+                }
+            }
+        }
 
         if(mTouchpadHandler != null)
             mTouchpadHandler.reloadPreferences(p);
@@ -1083,9 +1204,10 @@ public class TouchInputHandler {
             return (e.getButtonState() & button) == button;
         }
 
-        int extractButtons(MotionEvent e) {
+        int extractButtons(MotionEvent e, int pointerIndex) {
+            float p = e.getPressure(pointerIndex);
             if (mInjector.stylusButtonContactModifierMode) {
-                if (e.getPressure() > 0) {
+                if (p > 0) {
                     if (hasButton(e, MotionEvent.BUTTON_STYLUS_SECONDARY))
                         return (1 << 1);
                     if (hasButton(e, MotionEvent.BUTTON_STYLUS_PRIMARY))
@@ -1095,7 +1217,7 @@ public class TouchInputHandler {
                 } else return 0;
             } else {
                 int buttons = 0;
-                if (e.getPressure() > 0)
+                if (p > 0)
                     buttons = mStylusInputHelperMode;
                 if (hasButton(e, MotionEvent.BUTTON_STYLUS_SECONDARY))
                     buttons |= (1 << 1);
@@ -1106,17 +1228,24 @@ public class TouchInputHandler {
             }
         }
 
+        int extractButtons(MotionEvent e) {
+            return extractButtons(e, e.getActionIndex());
+        }
+
         @SuppressLint("ClickableViewAccessibility")
-        boolean onTouch(MotionEvent e) {
-            int action = e.getAction();
+        boolean onTouch(MotionEvent e, int pointerIndex) {
+            if (e == null || pointerIndex < 0 || pointerIndex >= e.getPointerCount())
+                return false;
+
+            int action = e.getActionMasked();
             int tiltX = 0, tiltY = 0;
-            int newButtons = extractButtons(e);
-            float newX = e.getX(e.getActionIndex()), newY = e.getY(e.getActionIndex());
+            int newButtons = extractButtons(e, pointerIndex);
+            float newX = e.getX(pointerIndex), newY = e.getY(pointerIndex);
             InputDevice dev = e.getDevice();
-            InputDevice.MotionRange rangeX = dev.getMotionRange(MotionEvent.AXIS_X);
-            InputDevice.MotionRange rangeY = dev.getMotionRange(MotionEvent.AXIS_Y);
-            boolean hasTilt = e.getDevice().getMotionRange(MotionEvent.AXIS_TILT) != null;
-            boolean hasOrientation = e.getDevice().getMotionRange(MotionEvent.AXIS_ORIENTATION) != null;
+            InputDevice.MotionRange rangeX = dev != null ? dev.getMotionRange(MotionEvent.AXIS_X) : null;
+            InputDevice.MotionRange rangeY = dev != null ? dev.getMotionRange(MotionEvent.AXIS_Y) : null;
+            boolean hasTilt = dev != null && dev.getMotionRange(MotionEvent.AXIS_TILT) != null;
+            boolean hasOrientation = dev != null && dev.getMotionRange(MotionEvent.AXIS_ORIENTATION) != null;
 
             if (hasPointerCapture(mActivity.getLorieView()) &&
                     isExternal(dev) && rangeX != null && rangeY != null) {
@@ -1127,13 +1256,24 @@ public class TouchInputHandler {
             newX = mappedPoint[0];
             newY = mappedPoint[1];
 
-            if (x == newX && y == newY && pressure == e.getPressure() && tilt == e.getAxisValue(MotionEvent.AXIS_TILT) &&
-                    orientation == e.getAxisValue(MotionEvent.AXIS_ORIENTATION) && buttons == newButtons)
+            float currentPressure = e.getPressure(pointerIndex);
+            float currentTilt = hasTilt ? e.getAxisValue(MotionEvent.AXIS_TILT, pointerIndex) : 0;
+            float currentOrientation = hasOrientation ? e.getAxisValue(MotionEvent.AXIS_ORIENTATION, pointerIndex) : 0;
+
+            if (action == MotionEvent.ACTION_UP ||
+                (action == MotionEvent.ACTION_POINTER_UP && e.getActionIndex() == pointerIndex) ||
+                action == MotionEvent.ACTION_CANCEL) {
+                currentPressure = 0;
+                newButtons = 0;
+            }
+
+            if (x == newX && y == newY && pressure == currentPressure && tilt == currentTilt &&
+                    orientation == currentOrientation && buttons == newButtons)
                 return true;
 
             if (hasTilt && hasOrientation) {
-                orientation = e.getAxisValue(MotionEvent.AXIS_ORIENTATION);
-                tilt = e.getAxisValue(MotionEvent.AXIS_TILT);
+                orientation = currentOrientation;
+                tilt = currentTilt;
                 tiltX = (int) Math.round((float) Math.asin(-Math.sin(orientation) * Math.sin(tilt)) * 63.5 - 0.5);
                 tiltY = (int) Math.round((float) Math.asin( Math.cos(orientation) * Math.sin(tilt)) * 63.5 - 0.5);
             }
@@ -1141,15 +1281,20 @@ public class TouchInputHandler {
             mInjector.sendStylusEvent(
                     x = newX,
                     y = newY,
-                    (int) ((pressure = e.getPressure()) * 65535),
+                    (int) ((pressure = currentPressure) * 65535),
                     tiltX,
                     tiltY,
                     convertOrientation(orientation),
                     buttons = newButtons,
-                    e.getToolType(e.getActionIndex()) == MotionEvent.TOOL_TYPE_ERASER,
+                    e.getToolType(pointerIndex) == MotionEvent.TOOL_TYPE_ERASER,
                     mInjector.stylusIsMouse);
 
             return true;
+        }
+
+        @SuppressLint("ClickableViewAccessibility")
+        boolean onTouch(MotionEvent e) {
+            return onTouch(e, e.getActionIndex());
         }
     }
 

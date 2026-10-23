@@ -133,4 +133,14 @@
         <item>lanczos</item>
         <item>custom</item>
     </string-array>
+    <string-array name="palmRejectionEntries">
+        <item>Stylus Priority + Contact Area (Recommended)</item>
+        <item>Stylus Priority Only (Air-gap guard)</item>
+        <item>Pen Only (Disable all finger touch)</item>
+    </string-array>
+    <string-array name="palmRejectionValues">
+        <item>stylus_and_area</item>
+        <item>stylus_priority</item>
+        <item>pen_only</item>
+    </string-array>
 </resources>

@@ -51,6 +51,7 @@ dependencies {
     implementation 'androidx.lifecycle:lifecycle-viewmodel-ktx:2.11.0'
     implementation 'androidx.preference:preference:1.2.1'
     compileOnly project(':shell-loader:stub')
+    testImplementation 'junit:junit:4.13.2'
 }
 afterEvaluate {
     tasks.register("generatePrefs") {
