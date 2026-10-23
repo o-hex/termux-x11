@@ -581,7 +581,7 @@ index 4ad729864..5848d5c67 100644
  #include <X11/X.h>
  #include "scrnintstr.h"
  #include "misc.h"
-@@ -90,8 +91,36 @@ struct present_vblank {
+@@ -90,8 +91,37 @@ struct present_vblank {
      Bool                abort_flip;     /* aborting this flip */
      PresentFlipReason   reason;         /* reason for which flip is not possible */
      Bool                has_suboptimal; /* whether client can support SuboptimalCopy mode */
