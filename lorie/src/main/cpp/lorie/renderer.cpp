@@ -445,21 +445,27 @@ static bool cpuAndGpuShareAhbMemory(EGLDisplay egl_display) {
                              -1, nullptr, (void **) &pixels) != 0 || !pixels)
         goto out;
     pixels[0] = 0;
+    AHardwareBuffer_unlock(buf, nullptr);
+    pixels = nullptr;
 
-    // GPU writes while the buffer is locked by the CPU.
+    // GPU writes while the buffer is not locked by the CPU.
     glClearColor(0x11 / 255.f, 0x22 / 255.f, 0x33 / 255.f, 1.f);
     glClear(GL_COLOR_BUFFER_BIT);
     glFinish();
 
-    if ((pixels[0] & 0xffffff) != 0x332211) {
-        loge("CPU mapping does not see GPU writes (got %08x)", pixels[0]);
-        AHardwareBuffer_unlock(buf, nullptr);
+    if (AHardwareBuffer_lock(buf, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
+                             -1, nullptr, (void **) &pixels) != 0 || !pixels)
+        goto out;
+    uint32_t gpuPixel = pixels[0];
+    AHardwareBuffer_unlock(buf, nullptr);
+    pixels = nullptr;
+
+    if ((gpuPixel & 0xffffff) != 0x332211) {
+        loge("CPU mapping does not see GPU writes (got %08x)", gpuPixel);
         result = false;
         goto out;
     }
 
-    // Unlocking must not bring back stale CPU data over what the GPU has written.
-    AHardwareBuffer_unlock(buf, nullptr);
     {
         uint8_t px[4] = {0, 0, 0, 0};
         glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
@@ -470,6 +476,8 @@ static bool cpuAndGpuShareAhbMemory(EGLDisplay egl_display) {
     }
 
 out:
+    if (pixels)
+        AHardwareBuffer_unlock(buf, nullptr);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     if (fbo)
         glDeleteFramebuffers(1, &fbo);
