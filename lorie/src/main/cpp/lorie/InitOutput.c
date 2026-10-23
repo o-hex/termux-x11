@@ -15,6 +15,7 @@
 #include <sys/eventfd.h>
 #include <sys/errno.h>
 #include <sys/socket.h>
+#include <poll.h>
 #include <stdio.h>
 #include <string.h>
 #include <libxcvt/libxcvt.h>
@@ -54,6 +55,18 @@ extern void android_shmem_sysv_shm_force(uint8_t enable);
 extern DeviceIntPtr lorieMouse, lorieKeyboard;
 
 #define CREATE_PIXMAP_USAGE_LORIEBUFFER_BACKED 5
+#define AHB_HANDSHAKE_TIMEOUT_MS 3000
+
+static int lorieWaitForSocketEvent(int fd, short events) {
+    struct pollfd descriptor = { .fd = fd, .events = events, .revents = 0 };
+    int result;
+    do {
+        result = poll(&descriptor, 1, AHB_HANDSHAKE_TIMEOUT_MS);
+    } while (result < 0 && errno == EINTR);
+
+    return result == 1 && (descriptor.revents & events) != 0 &&
+           (descriptor.revents & (POLLERR | POLLNVAL)) == 0;
+}
 
 struct vblank {
     struct xorg_list link;
@@ -981,6 +994,19 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     desc = LorieBuffer_description(srcBuffer);
     dstDesc = LorieBuffer_description(dstBuffer);
 
+    /* Transfer an idle CPU mapping back to the GPU before queuing the write. */
+    LoriePixmapPriv *dstPriv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(dst);
+    if (dstDesc->type == LORIEBUFFER_AHARDWAREBUFFER && dstPriv && dstPriv->locked) {
+        if (LorieBuffer_unlock(dstPriv->buffer) != 0) {
+            gpuCopyAttempts++;
+            gpuCopyDisabled++;
+            return FALSE;
+        }
+        dstPriv->locked = NULL;
+        dstPriv->wasLocked = false;
+        dst->devPrivate.ptr = NULL;
+    }
+
     if (update) {
         numRects = RegionNumRects(update);
         box = RegionRects(update);
@@ -1279,6 +1305,7 @@ static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *
 #define check(cond, msg, ...) if ((cond)) fail(msg, ##__VA_ARGS__)
     const CARD64 AHARDWAREBUFFER_SOCKET_FD = 1255;
     const CARD64 AHARDWAREBUFFER_FLIPPED_SOCKET_FD = 1256;
+    const CARD64 AHARDWAREBUFFER_RGBA_SOCKET_FD = 1257;
     const CARD64 RAW_MMAPPABLE_FD = 1274;
     AHardwareBuffer_Desc desc = {0};
     AHardwareBuffer* buffer = NULL;
@@ -1287,6 +1314,7 @@ static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *
 
     check(num_fds > 1, "DRI3: More than 1 fd");
     check(modifier != RAW_MMAPPABLE_FD && modifier != AHARDWAREBUFFER_SOCKET_FD && modifier != AHARDWAREBUFFER_FLIPPED_SOCKET_FD &&
+          modifier != AHARDWAREBUFFER_RGBA_SOCKET_FD &&
           modifier != DRM_FORMAT_MOD_INVALID && modifier != DRM_FORMAT_MOD_LINEAR, "DRI3: Modifier is not RAW_MMAPPABLE_FD or AHARDWAREBUFFER_SOCKET_FD");
 
     pixmap = screen->CreatePixmap(screen, 0, 0, depth, 0);
@@ -1305,16 +1333,25 @@ static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *
         return pixmap;
     }
 
-    if (modifier == AHARDWAREBUFFER_SOCKET_FD || modifier == AHARDWAREBUFFER_FLIPPED_SOCKET_FD) {
+    if (modifier == AHARDWAREBUFFER_SOCKET_FD || modifier == AHARDWAREBUFFER_FLIPPED_SOCKET_FD ||
+        modifier == AHARDWAREBUFFER_RGBA_SOCKET_FD) {
         struct stat info;
         uint8_t buf = 1;
         int r;
+        ssize_t write_result;
 
         priv->flipped = modifier == AHARDWAREBUFFER_FLIPPED_SOCKET_FD;
         check(fstat(fds[0], &info) != 0, "DRI3: fstat failed: %s", strerror(errno));
         check(!S_ISSOCK(info.st_mode), "DRI3: modifier is AHARDWAREBUFFER_SOCKET_FD but fd is not a socket");
-        // Sending signal to other end of socket to send buffer.
-        check(write(fds[0], &buf, 1) != 1, "DRI3: AHARDWAREBUFFER_SOCKET_FD: failed to write to socket: %s", strerror(errno));
+        // Sending signal to other end of socket to send buffer with timeout.
+        check(!lorieWaitForSocketEvent(fds[0], POLLOUT),
+              "DRI3: AHARDWAREBUFFER_SOCKET_FD: timed out sending acknowledgement");
+        do {
+            write_result = write(fds[0], &buf, 1);
+        } while (write_result < 0 && errno == EINTR);
+        check(write_result != 1, "DRI3: AHARDWAREBUFFER_SOCKET_FD: failed to write to socket: %s", strerror(errno));
+        check(!lorieWaitForSocketEvent(fds[0], POLLIN),
+              "DRI3: AHARDWAREBUFFER_SOCKET_FD: timed out waiting for buffer handle");
         check((r = LorieBuffer_recvAHardwareBufferHandleFromUnixSocket(fds[0], &buffer)) != 0,
               "DRI3: AHARDWAREBUFFER_SOCKET_FD: failed to obtain AHardwareBuffer from socket: %d", r);
         check(!buffer, "DRI3: AHARDWAREBUFFER_SOCKET_FD: did not receive AHardwareSocket from buffer");
@@ -1323,6 +1360,9 @@ static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *
             && desc.format != AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM
             && desc.format != AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM,
             "DRI3: AHARDWAREBUFFER_SOCKET_FD: wrong format of AHardwareBuffer. Must be one of: AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM, AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM (stands for 5).");
+        check(desc.width < width || desc.height < height,
+              "DRI3: AHardwareBuffer %ux%u is smaller than pixmap %ux%u",
+              desc.width, desc.height, width, height);
         priv->buffer = LorieBuffer_wrapAHardwareBuffer(buffer);
         buffer = NULL;
         check(!priv->buffer, "DRI3: LorieBuffer_wrapAHardwareBuffer failed.");
@@ -1331,9 +1371,11 @@ static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *
         priv->gpuOnly = LorieBuffer_lock(priv->buffer, &probe) != 0;
         LorieBuffer_unlock(priv->buffer);
 
-        screen->ModifyPixmapHeader(pixmap, desc.width, desc.height, 0, 0, desc.stride * 4, NULL);
+        /* The AHB may contain physical padding hidden from the X pixmap. */
+        screen->ModifyPixmapHeader(pixmap, width, height, 0, 0, desc.stride * 4, NULL);
         if (lorieServerDebugEnabled)
-            log(INFO, "DRI3: imported AHardwareBuffer, modifier %llu, %ux%u stride %u%s", (unsigned long long) modifier, desc.width, desc.height, desc.stride, priv->gpuOnly ? ", not lockable" : "");
+            log(INFO, "DRI3: imported AHardwareBuffer, modifier %llu, logical %ux%u physical %ux%u stride %u%s",
+                (unsigned long long) modifier, width, height, desc.width, desc.height, desc.stride, priv->gpuOnly ? ", not lockable" : "");
     }
 
     return pixmap;
