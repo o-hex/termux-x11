@@ -1,5 +1,8 @@
-+++ ./Xext/shm.c
-@@ -193,6 +193,10 @@
+diff --git a/Xext/shm.c b/Xext/shm.c
+index 1eed91bc5..7405223e7 100644
+--- a/Xext/shm.c
++++ b/Xext/shm.c
+@@ -193,6 +193,10 @@ CheckForShmSyscall(void)
  
  #endif
  
@@ -10,8 +13,11 @@
  static Bool
  ShmCloseScreen(ScreenPtr pScreen)
  {
-+++ ./Xext/shmint.h
-@@ -80,6 +80,8 @@
+diff --git a/Xext/shmint.h b/Xext/shmint.h
+index 9dadea756..e4e6f4db6 100644
+--- a/Xext/shmint.h
++++ b/Xext/shmint.h
+@@ -80,6 +80,8 @@ typedef struct _ShmDesc {
  #define SHMDESC_IS_FD(shmdesc)  (0)
  #endif
  
@@ -42,7 +48,7 @@
  WorkQueuePtr workQueue;
  static WorkQueuePtr *workQueueLast = &workQueue;
  
-@@ -583,6 +588,11 @@
+@@ -583,6 +588,11 @@ QueueWorkProc(Bool (*function) (ClientPtr pClient, void *closure),
      return TRUE;
  }
  
@@ -54,9 +60,11 @@
  /*
   * Manage a queue of sleeping clients, awakening them
   * when requested, by using the OS functions IgnoreClient
-
-+++ ./dix/enterleave.c
-@@ -1541,6 +1541,8 @@
+diff --git a/dix/enterleave.c b/dix/enterleave.c
+index 18b5d66cd..a6fa80d8b 100644
+--- a/dix/enterleave.c
++++ b/dix/enterleave.c
+@@ -1541,6 +1541,8 @@ DeviceFocusEvents(DeviceIntPtr dev, WindowPtr from, WindowPtr to, int mode)
      }
  }
  
@@ -65,7 +73,7 @@
  /**
   * Figure out if focus events are necessary and send them to the
   * appropriate windows.
-@@ -1551,6 +1553,9 @@
+@@ -1551,6 +1553,9 @@ DeviceFocusEvents(DeviceIntPtr dev, WindowPtr from, WindowPtr to, int mode)
  void
  DoFocusEvents(DeviceIntPtr pDev, WindowPtr from, WindowPtr to, int mode)
  {
@@ -75,8 +83,11 @@
      if (!IsKeyboardDevice(pDev))
          return;
  
-+++ ./dix/main.c
-@@ -268,6 +268,7 @@
+diff --git a/dix/main.c b/dix/main.c
+index 38e29cebb..e4957e9bc 100644
+--- a/dix/main.c
++++ b/dix/main.c
+@@ -268,6 +268,7 @@ dix_main(int argc, char *argv[], char *envp[])
          }
  
          NotifyParentProcess();
@@ -84,6 +95,95 @@
  
          InputThreadInit();
  
++++ ./dri3/dri3_request.c
+@@ -227,6 +227,35 @@ proc_dri3_pixmap_from_buffer(ClientPtr client)
+     return Success;
+ }
+ 
++/* Lorie: not part of upstream DRI3. Implemented in lorie/InitOutput.c, which knows about
++ * LorieBuffer/AHardwareBuffer; this file stays free of Android-specific types. */
++extern int lorieSendAHardwareBufferForPixmap(PixmapPtr pixmap, int socketFd);
++
++static int
++proc_dri3_ahardwarebuffer_from_pixmap(ClientPtr client)
++{
++    REQUEST(xDRI3AHardwareBufferFromPixmapReq);
++    PixmapPtr pixmap;
++    int fd, rc;
++
++    SetReqFds(client, 1);
++    REQUEST_SIZE_MATCH(xDRI3AHardwareBufferFromPixmapReq);
++    rc = dixLookupResourceByType((void **) &pixmap, stuff->pixmap, RT_PIXMAP,
++                                 client, DixReadAccess);
++    if (rc != Success) {
++        client->errorValue = stuff->pixmap;
++        return rc;
++    }
++
++    fd = ReadFdFromClient(client);
++    if (fd < 0)
++        return BadValue;
++
++    rc = lorieSendAHardwareBufferForPixmap(pixmap, fd) ? Success : BadMatch;
++    close(fd);
++    return rc;
++}
++
+ static int
+ proc_dri3_buffer_from_pixmap(ClientPtr client)
+ {
+@@ -250,7 +279,7 @@ proc_dri3_buffer_from_pixmap(ClientPtr client)
+     }
+ 
+     rep.width = pixmap->drawable.width;
+-    rep.height = pixmap->drawable.height;
++    rep.height = (pixmap->drawable.height + 3) & ~3;
+     rep.depth = pixmap->drawable.depth;
+     rep.bpp = pixmap->drawable.bitsPerPixel;
+ 
+@@ -522,7 +551,7 @@ proc_dri3_buffers_from_pixmap(ClientPtr client)
+     rep.nfd = num_fds;
+     rep.length = bytes_to_int32(num_fds * 2 * sizeof(CARD32));
+     rep.width = pixmap->drawable.width;
+-    rep.height = pixmap->drawable.height;
++    rep.height = (pixmap->drawable.height + 3) & ~3;
+     rep.depth = pixmap->drawable.depth;
+     rep.bpp = pixmap->drawable.bitsPerPixel;
+     rep.modifier = modifier;
+@@ -564,6 +593,7 @@ int (*proc_dri3_vector[DRI3NumberRequests]) (ClientPtr) = {
+     proc_dri3_get_supported_modifiers,  /* 6 */
+     proc_dri3_pixmap_from_buffers,      /* 7 */
+     proc_dri3_buffers_from_pixmap,      /* 8 */
++    [X_DRI3AHardwareBufferFromPixmap] = proc_dri3_ahardwarebuffer_from_pixmap, /* 200, Lorie */
+ };
+ 
+ int
+@@ -697,6 +727,17 @@ sproc_dri3_buffers_from_pixmap(ClientPtr client)
+     return (*proc_dri3_vector[stuff->dri3ReqType]) (client);
+ }
+ 
++static int _X_COLD
++sproc_dri3_ahardwarebuffer_from_pixmap(ClientPtr client)
++{
++    REQUEST(xDRI3AHardwareBufferFromPixmapReq);
++    REQUEST_SIZE_MATCH(xDRI3AHardwareBufferFromPixmapReq);
++
++    swaps(&stuff->length);
++    swapl(&stuff->pixmap);
++    return (*proc_dri3_vector[stuff->dri3ReqType]) (client);
++}
++
+ int (*sproc_dri3_vector[DRI3NumberRequests]) (ClientPtr) = {
+     sproc_dri3_query_version,           /* 0 */
+     sproc_dri3_open,                    /* 1 */
+@@ -707,6 +748,7 @@ int (*sproc_dri3_vector[DRI3NumberRequests]) (ClientPtr) = {
+     sproc_dri3_get_supported_modifiers, /* 6 */
+     sproc_dri3_pixmap_from_buffers,     /* 7 */
+     sproc_dri3_buffers_from_pixmap,     /* 8 */
++    [X_DRI3AHardwareBufferFromPixmap] = sproc_dri3_ahardwarebuffer_from_pixmap, /* 200, Lorie */
+ };
+ 
+ int _X_COLD
 +++ ./exa/exa_unaccel.c
 @@ -384,10 +384,10 @@
 -        pExaScr->prepare_access_reg(pPixmap, EXA_PREPARE_SRC, prgnSrc);
@@ -111,8 +211,11 @@
  ddxInputThreadInit(void);
  extern _X_EXPORT int
  TimeSinceLastInputEvent(void);
-+++ ./include/xkbfile.h
-@@ -79,6 +79,36 @@
+diff --git a/include/xkbfile.h b/include/xkbfile.h
+index f93d31ab0..f65338ac4 100644
+--- a/include/xkbfile.h
++++ b/include/xkbfile.h
+@@ -79,6 +79,36 @@ typedef void (*XkbFileAddOnFunc) (FILE * /* file */ ,
  
  /***====================================================================***/
  
@@ -149,8 +252,11 @@
  _XFUNCPROTOBEGIN
  
  extern _X_EXPORT char *XkbIndentText(unsigned   /* size */
-+++ ./os/connection.c
-@@ -185,9 +185,10 @@
+diff --git a/os/connection.c b/os/connection.c
+index 35e2a4d45..2e80d8835 100644
+--- a/os/connection.c
++++ b/os/connection.c
+@@ -185,9 +185,10 @@ InitParentProcess(void)
  {
  #if !defined(WIN32)
      OsSigHandlerPtr handler;
@@ -162,8 +268,11 @@
          RunFromSmartParent = TRUE;
      OsSignal(SIGUSR1, handler);
      ParentProcess = getppid();
-+++ ./os/osinit.c
-@@ -170,13 +170,11 @@
+diff --git a/os/osinit.c b/os/osinit.c
+index 8575319ff..a6d0dfccc 100644
+--- a/os/osinit.c
++++ b/os/osinit.c
+@@ -170,13 +170,11 @@ OsInit(void)
  #endif
  
      if (!been_here) {
@@ -179,8 +288,11 @@
              SIGXCPU,
              SIGXFSZ,
  #ifdef SIGEMT
-+++ ./os/utils.c
-@@ -214,6 +214,8 @@
+diff --git a/os/utils.c b/os/utils.c
+index 008ed0463..fae554b22 100644
+--- a/os/utils.c
++++ b/os/utils.c
+@@ -214,6 +214,8 @@ OsSignal(int sig, OsSigHandlerPtr handler)
  {
  #if defined(WIN32) && !defined(__CYGWIN__)
      return signal(sig, handler);
@@ -189,7 +301,7 @@
  #else
      struct sigaction act, oact;
  
-@@ -234,7 +236,7 @@
+@@ -234,7 +236,7 @@ OsSignal(int sig, OsSigHandlerPtr handler)
   * server at a time.  This keeps the servers from stomping on each other
   * if the user forgets to give them different display numbers.
   */
@@ -198,7 +310,7 @@
  #define LOCK_TMP_PREFIX "/.tX"
  #define LOCK_PREFIX "/.X"
  #define LOCK_SUFFIX "-lock"
-@@ -326,7 +328,7 @@
+@@ -326,7 +328,7 @@ LockServer(void)
      i = 0;
      haslock = 0;
      while ((!haslock) && (i++ < 3)) {
@@ -207,7 +319,7 @@
          if (haslock) {
              /*
               * We're done.
-@@ -1421,12 +1423,45 @@
+@@ -1421,12 +1423,45 @@ static struct pid {
      int pid;
  } *pidlist;
  
@@ -254,7 +366,7 @@
  
      if (command == NULL || type == NULL)
          return NULL;
-@@ -1442,6 +1477,10 @@
+@@ -1442,6 +1477,10 @@ Popen(const char *command, const char *type)
          return NULL;
      }
  
@@ -265,7 +377,7 @@
      /* Ignore the smart scheduler while this is going on */
  #ifdef HAVE_SETITIMER
      if (SmartSchedulePause() < 0) {
-@@ -1457,6 +1496,8 @@
+@@ -1457,6 +1496,8 @@ Popen(const char *command, const char *type)
      case -1:                   /* error */
          close(pdes[0]);
          close(pdes[1]);
@@ -274,7 +386,7 @@
          free(cur);
  #ifdef HAVE_SETITIMER
          if (SmartScheduleEnable() < 0)
-@@ -1484,14 +1525,29 @@
+@@ -1484,14 +1525,29 @@ Popen(const char *command, const char *type)
              }
              close(pdes[1]);
          }
@@ -306,7 +418,7 @@
      if (*type == 'r') {
          iop = fdopen(pdes[0], type);
          close(pdes[1]);
-@@ -1628,6 +1684,8 @@
+@@ -1628,6 +1684,8 @@ Pclose(void *iop)
          pid = waitpid(cur->pid, &pstat, 0);
      } while (pid == -1 && errno == EINTR);
  
@@ -315,8 +427,11 @@
      if (last == NULL)
          pidlist = cur->next;
      else
-+++ ./present/present.h
-@@ -93,6 +93,9 @@
+diff --git a/present/present.h b/present/present.h
+index d41b36033..80f1c6345 100644
+--- a/present/present.h
++++ b/present/present.h
+@@ -93,6 +93,9 @@ typedef Bool (*present_flip_ptr) (RRCrtcPtr crtc,
                                    uint64_t target_msc,
                                    PixmapPtr pixmap,
                                    Bool sync_flip);
@@ -326,7 +441,7 @@
  /* Flip pixmap for window, return false if it didn't happen.
   *
   * Like present_flip_ptr, additionally with:
-@@ -134,6 +137,7 @@
+@@ -134,6 +137,7 @@ typedef struct present_screen_info {
      uint32_t                            capabilities;
      present_check_flip_ptr              check_flip;
      present_flip_ptr                    flip;
@@ -334,17 +449,20 @@
      present_unflip_ptr                  unflip;
      present_check_flip2_ptr             check_flip2;
  
-+++ ./present/present_execute.c
-@@ -34,5 +34,7 @@
+diff --git a/present/present_execute.c b/present/present_execute.c
+index 68a5878be..efe76d906 100644
+--- a/present/present_execute.c
++++ b/present/present_execute.c
+@@ -33,6 +33,8 @@ present_wait_fence_triggered(void *param)
+     present_vblank_ptr      vblank = param;
      ScreenPtr               screen = vblank->screen;
      present_screen_priv_ptr screen_priv = present_screen_priv(screen);
--
 +    /* lorie: disarm, or miSyncTriggerFence()'s restart-scan re-fires this callback. */
 +    present_fence_set_callback(vblank->wait_fence, NULL, NULL);
-+
+ 
      screen_priv->re_execute(vblank);
  }
-@@ -67,6 +69,14 @@
+@@ -67,6 +69,14 @@ present_execute_copy(present_vblank_ptr vblank, uint64_t crtc_msc)
      WindowPtr                   window = vblank->window;
      ScreenPtr                   screen = window->drawable.pScreen;
      present_screen_priv_ptr screen_priv = present_screen_priv(screen);
@@ -359,7 +477,7 @@
  
      /* If present_flip failed, we may have to requeue for the next MSC */
      if (vblank->exec_msc == crtc_msc + 1 &&
-@@ -79,12 +95,85 @@
+@@ -79,12 +95,86 @@
          return;
      }
  
@@ -435,6 +553,7 @@
 +        screen_priv->flush(window);
 +        return;
 +    } else {
++        lorieGpuCopyFlush();
 +        present_copy_region(&window->drawable, vblank->pixmap, vblank->update, vblank->x_off, vblank->y_off);
 +
 +        /* present_copy_region sticks the region into a scratch GC,
@@ -450,7 +569,10 @@
      screen_priv->flush(window);
  
      present_pixmap_idle(vblank->pixmap, vblank->window, vblank->serial, vblank->idle_fence);
-+++ ./present/present_priv.h
+diff --git a/present/present_priv.h b/present/present_priv.h
+index 4ad729864..5848d5c67 100644
+--- a/present/present_priv.h
++++ b/present/present_priv.h
 @@ -24,6 +24,7 @@
  #define _PRESENT_PRIV_H_
  
@@ -459,7 +581,7 @@
  #include <X11/X.h>
  #include "scrnintstr.h"
  #include "misc.h"
-@@ -90,8 +91,35 @@
+@@ -90,8 +91,37 @@ struct present_vblank {
      Bool                abort_flip;     /* aborting this flip */
      PresentFlipReason   reason;         /* reason for which flip is not possible */
      Bool                has_suboptimal; /* whether client can support SuboptimalCopy mode */
@@ -479,6 +601,8 @@
 +                                     uint64_t *out_serial, void **out_dst_buffer);
 +extern Bool lorieGpuCopyIsDone(uint64_t serial);
 +extern void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer);
++/* lorie: waits for all queued GPU copies, so a CPU copy done after them can not be overwritten by an older one. */
++extern void lorieGpuCopyFlush(void);
 +/* lorie: the pixmap's buffer can not be locked for the CPU, so Present must never use a CPU copy for it. */
 +extern Bool loriePixmapIsGpuOnly(PixmapPtr pixmap);
 +/* lorie: implemented in lorie/cmdentrypoint.c. Avoids waiting forever on a GPU copy that a dead renderer will never finish. */
@@ -495,8 +619,11 @@
  typedef struct present_screen_priv present_screen_priv_rec, *present_screen_priv_ptr;
  typedef struct present_window_priv present_window_priv_rec, *present_window_priv_ptr;
  
-+++ ./present/present_scmd.c
-@@ -252,6 +252,21 @@
+diff --git a/present/present_scmd.c b/present/present_scmd.c
+index 239055bc1..6c6e6d2a1 100644
+--- a/present/present_scmd.c
++++ b/present/present_scmd.c
+@@ -252,6 +252,21 @@ present_flip_try_ready(ScreenPtr screen)
      }
  }
  
@@ -518,7 +645,7 @@
  static void
  present_flip_idle(ScreenPtr screen)
  {
-@@ -599,6 +614,8 @@
+@@ -599,6 +614,8 @@ present_execute(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)
                      damage = &window->clipList;
  
                  DamageDamageRegion(&vblank->window->drawable, damage);
@@ -565,8 +692,11 @@
      /* Remove vblank from window and screen lists */
      xorg_list_del(&vblank->window_list);
      /* Also make sure vblank is removed from event queue (wnmd) */
-+++ ./xkb/ddxLoad.c
-@@ -56,6 +56,9 @@
+diff --git a/xkb/ddxLoad.c b/xkb/ddxLoad.c
+index f9b7b06d9..f4b2aeddc 100644
+--- a/xkb/ddxLoad.c
++++ b/xkb/ddxLoad.c
+@@ -56,6 +56,9 @@ THE USE OR PERFORMANCE OF THIS SOFTWARE.
  #define PATHSEPARATOR "/"
  #endif
  
@@ -576,7 +706,7 @@
  static unsigned
  LoadXKM(unsigned want, unsigned need, const char *keymap, XkbDescPtr *xkbRtrn);
  
-@@ -152,6 +155,25 @@
+@@ -152,6 +155,25 @@ RunXkbComp(xkbcomp_buffer_callback callback, void *userdata)
                   xkm_output_dir, keymap) == -1)
          buf = NULL;
  

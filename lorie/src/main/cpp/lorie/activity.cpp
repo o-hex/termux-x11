@@ -461,6 +461,18 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, __unused void *reserved) {
                 if (!r || r->destroyed) return;
                 r->renderer.setFiltering(filtering);
             }},
+            {"setCustomScaler", "(JLjava/lang/String;)V", (void *) +[](JNIEnv* env, __unused jobject self, jlong ptr, jstring jname) {
+                auto* r = (LorieViewResources*) ptr;
+                if (!r || r->destroyed) return;
+                const char* str = jname ? env->GetStringUTFChars(jname, nullptr) : nullptr;
+                r->renderer.setCustomScaler(str ? str : "off");
+                if (str) env->ReleaseStringUTFChars(jname, str);
+            }},
+            {"setSwapInterval", "(JI)V", (void *) +[](__unused JNIEnv* env, __unused jobject self, jlong ptr, jint interval) {
+                auto* r = (LorieViewResources*) ptr;
+                if (!r || r->destroyed) return;
+                r->renderer.setSwapInterval(interval);
+            }},
             {"connect", "(JI)V", (void *) +[](__unused JNIEnv* env, __unused jclass clazz, jlong ptr, jint fd) {
                 auto* r = (LorieViewResources*) ptr;
                 if (!r) return;

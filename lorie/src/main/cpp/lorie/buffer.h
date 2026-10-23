@@ -145,6 +145,17 @@ const LorieBuffer_Desc* _Nonnull LorieBuffer_description(LorieBuffer* _Nullable 
 int LorieBuffer_lock(LorieBuffer* _Nullable buffer, void* _Nullable * _Nonnull out);
 
 /**
+ * Bracket CPU access to a buffer backed by a dma-buf file descriptor. The caches have to be
+ * synchronized with the device that rendered into or will read the buffer, otherwise stale cache
+ * lines show up as partially updated rows. Does nothing for other kinds of buffers.
+ *
+ * @param write whether the CPU is going to write to the buffer
+ * @return true if the access was started and LorieBuffer_cpuAccessEnd has to be called
+ */
+bool LorieBuffer_cpuAccessBegin(LorieBuffer* _Nullable buffer, bool write);
+void LorieBuffer_cpuAccessEnd(LorieBuffer* _Nullable buffer, bool write);
+
+/**
  * Unlock the AHardwareBuffer from direct CPU access.
  * See AHardwareBuffer_unlock() description for details
  *
@@ -168,6 +179,17 @@ void LorieBuffer_sendHandleToUnixSocket(LorieBuffer* _Nonnull buffer, int socket
  * @param outBuffer
  */
 void LorieBuffer_recvHandleFromUnixSocket(int socketFd, LorieBuffer* _Nullable * _Nullable outBuffer);
+
+/**
+ * Send a raw AHardwareBuffer handle (not wrapped into a LorieBuffer) to an AF_UNIX socket.
+ * Unlike LorieBuffer_sendHandleToUnixSocket, this does not also transmit Lorie's own private
+ * LorieBuffer framing, so it can be received by a plain AHardwareBuffer_recvHandleFromUnixSocket
+ * call on the other end (e.g. a DRI3 client that only knows about AHardwareBuffer).
+ *
+ * @param buffer buffer to send.
+ * @param socketFd socket to send the handle over.
+ */
+void LorieBuffer_sendRawAHardwareBufferHandleToUnixSocket(AHardwareBuffer* _Nonnull buffer, int socketFd);
 
 /**
  * Attach buffer to GL. Must be done on GL thread.
