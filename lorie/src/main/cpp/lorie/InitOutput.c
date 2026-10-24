@@ -107,6 +107,7 @@ typedef struct {
     uint64_t rootGpuCopyPending;
 
     Bool requestLockHeld;
+    int swapInterval;
 } lorieScreenInfo;
 
 ScreenPtr pScreenPtr;
@@ -117,6 +118,7 @@ static lorieScreenInfo lorieScreen = {
         .root.framerate = 30,
         .root.name = "screen",
         .dri3 = TRUE,
+        .swapInterval = 1,
         .vblank_queue = { &lorieScreen.vblank_queue, &lorieScreen.vblank_queue },
 }, *pvfb = &lorieScreen;
 static char *xstartup = NULL;
@@ -952,9 +954,21 @@ static int loriePresentGetUstMsc(__unused RRCrtcPtr crtc, uint64_t *ust, uint64_
     return Success;
 }
 
+Bool lorieSwapIntervalIsZero(void) {
+    char *env = getenv("TERMUX_X11_SWAP_INTERVAL");
+    if (env)
+        return atoi(env) == 0;
+    return pvfb->swapInterval == 0;
+}
+
 static Bool loriePresentQueueVblank(__unused RRCrtcPtr crtc, uint64_t event_id, uint64_t msc) {
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "MemoryLeak" // it is not leaked, it is destroyed in lorieRedraw
+    if (msc <= pvfb->current_msc || lorieSwapIntervalIsZero()) {
+        present_event_notify(event_id, GetTimeInMicros(), pvfb->current_msc);
+        return Success;
+    }
+
     struct vblank* vblank = calloc (1, sizeof (*vblank));
     if (!vblank)
         return BadAlloc;
@@ -1308,7 +1322,15 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
                     lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
                 return FALSE;
             }
-            priv->wasLocked = FALSE;
+            /* Persistent screen mapping: If this is the screen root pixmap and no GPU copy is
+             * currently pending into it, retain the CPU lock across EXA accesses to prevent thrashing
+             * LorieBuffer_lock/unlock and kernel waitFence polling on every 2D draw call. */
+            Bool isScreenPixmap = (pScreenPtr && (pPix == pScreenPtr->GetScreenPixmap(pScreenPtr) ||
+                                                  pPix == pScreenPtr->devPrivate));
+            if (isScreenPixmap && pvfb->rootGpuCopyPending == 0)
+                priv->wasLocked = TRUE;
+            else
+                priv->wasLocked = FALSE;
         } else
             priv->wasLocked = TRUE;
     }
@@ -1399,7 +1421,16 @@ static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *
 
         priv->flipped = modifier == AHARDWAREBUFFER_FLIPPED_SOCKET_FD;
         check(fstat(fds[0], &info) != 0, "DRI3: fstat failed: %s", strerror(errno));
-        check(!S_ISSOCK(info.st_mode), "DRI3: modifier is AHARDWAREBUFFER_SOCKET_FD but fd is not a socket");
+        if (!S_ISSOCK(info.st_mode)) {
+            /* Standard DRI3 client passed modifier 1255 with a dma-buf fd instead of a UNIX socket */
+            log(WARN, "DRI3: modifier %llu specified but fd is not a socket (mode 0%o); falling back to dma-buf import",
+                (unsigned long long) modifier, info.st_mode);
+            check(!(priv->buffer = LorieBuffer_wrapFileDescriptor(width, strides[0]/4, height,
+                                                                 AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM, fds[0], offsets[0])),
+                  "DRI3: LorieBuffer_wrapFileDescriptor fallback failed.");
+            screen->ModifyPixmapHeader(pixmap, width, height, 0, 0, strides[0], NULL);
+            return pixmap;
+        }
         // Sending signal to other end of socket to send buffer with timeout.
         check(!lorieWaitForSocketEvent(fds[0], POLLOUT),
               "DRI3: AHARDWAREBUFFER_SOCKET_FD: timed out sending acknowledgement");
@@ -1555,7 +1586,13 @@ static int lorieGetFormats(__unused ScreenPtr screen, CARD32 *num_formats, CARD3
 }
 
 static int lorieGetModifiers(__unused ScreenPtr screen, uint32_t format, uint32_t *num_modifiers, uint64_t **modifiers) {
-    static uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
+    static uint64_t standard_modifiers[] = {
+        DRM_FORMAT_MOD_LINEAR,
+    };
+    static uint64_t socket_modifiers[] = {
+        DRM_FORMAT_MOD_LINEAR,
+        1255, /* AHARDWAREBUFFER_SOCKET_FD */
+    };
 
     if (format != DRM_FORMAT_ARGB8888 && format != DRM_FORMAT_XRGB8888) {
         *num_modifiers = 0;
@@ -1563,8 +1600,19 @@ static int lorieGetModifiers(__unused ScreenPtr screen, uint32_t format, uint32_
         return TRUE;
     }
 
-    *num_modifiers = 1;
-    *modifiers = &modifier;
+    static int enable_socket_mod = -1;
+    if (enable_socket_mod == -1) {
+        const char *env = getenv("TERMUX_X11_ENABLE_AHB_SOCKET_MODIFIER");
+        enable_socket_mod = (env && atoi(env) != 0) ? 1 : 0;
+    }
+
+    if (enable_socket_mod) {
+        *num_modifiers = sizeof(socket_modifiers) / sizeof(socket_modifiers[0]);
+        *modifiers = socket_modifiers;
+    } else {
+        *num_modifiers = sizeof(standard_modifiers) / sizeof(standard_modifiers[0]);
+        *modifiers = standard_modifiers;
+    }
     return TRUE;
 }
 
@@ -1599,6 +1647,7 @@ static dri3_screen_info_rec lorieDri3Info = {
 static int lorieGlxSwapInterval(unused __GLXdrawable *drawable, int interval) {
     if (interval < 0)
         return BadValue;
+    pvfb->swapInterval = interval;
     return Success;
 }
 
