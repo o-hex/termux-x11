@@ -1671,6 +1671,54 @@ static __GLXdrawable * createDrawable(unused ClientPtr client, __GLXscreen * scr
     return private;
 }
 
+/*
+ * GLX_EXT_texture_from_pixmap — server-side dispatch.
+ *
+ * Mesa's kgsl/DRIL client driver implements TFP by calling DRI3
+ * FdsFromPixmap to obtain the pixmap's backing dma-buf fd, then
+ * importing it as an EGLImage / GL texture entirely client-side.
+ * The server only needs to validate the request and return Success so
+ * the client proceeds; the actual pixel data never travels through the
+ * X protocol for the hardware path.
+ *
+ * For the software swrast fallback Mesa fetches pixel data via GetImage
+ * (standard X protocol), which works because every LorieBuffer is
+ * CPU-lockable through loriePrepareAccess / lorieFinishAccess.
+ */
+static int lorieGlxBindTexImage(unused __GLXcontext *ctx,
+                                 unused int buffer,
+                                 unused __GLXdrawable *drawable) {
+    return Success;
+}
+
+static int lorieGlxReleaseTexImage(unused __GLXcontext *ctx,
+                                    unused int buffer,
+                                    unused __GLXdrawable *drawable) {
+    return Success;
+}
+
+/*
+ * Thin createContext shim: delegates to __glXdirectContextCreate for all
+ * lifecycle management, then stamps on the TFP function pointers that the
+ * stub leaves NULL.  This is the only hook the lorie GLX screen needs —
+ * the "direct" context path handles every other GLX request correctly.
+ */
+static __GLXcontext *lorieGlxCreateContext(__GLXscreen *screen,
+                                            __GLXconfig *config,
+                                            __GLXcontext *share,
+                                            unused unsigned num_attribs,
+                                            unused const uint32_t *attribs,
+                                            int *error) {
+    __GLXcontext *ctx = __glXdirectContextCreate(screen, config, share);
+    if (!ctx) {
+        if (error) *error = BadAlloc;
+        return NULL;
+    }
+    ctx->bindTexImage    = lorieGlxBindTexImage;
+    ctx->releaseTexImage = lorieGlxReleaseTexImage;
+    return ctx;
+}
+
 static void glXDRIscreenDestroy(__GLXscreen *baseScreen) {
     free(baseScreen->GLXextensions);
     free(baseScreen->GLextensions);
@@ -1686,6 +1734,7 @@ static __GLXscreen *glXDRIscreenProbe(ScreenPtr pScreen) {
         return NULL;
 
     screen->destroy = glXDRIscreenDestroy;
+    screen->createContext = lorieGlxCreateContext;
     screen->createDrawable = createDrawable;
     screen->swapInterval = lorieGlxSwapInterval;
     screen->pScreen = pScreen;
